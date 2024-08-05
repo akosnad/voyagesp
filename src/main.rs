@@ -2,17 +2,15 @@ use std::thread::JoinHandle;
 
 use esp_idf_hal::{
     cpu::Core,
+    gpio::AnyIOPin,
     ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver},
     peripherals::Peripherals,
     prelude::*,
     task::thread::ThreadSpawnConfiguration,
-    gpio::AnyIOPin,
 };
 
 use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
-    nvs::EspDefaultNvsPartition,
-    timer::EspTaskTimerService,
+    eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, timer::EspTaskTimerService,
 };
 use esp_idf_sys::esp_restart;
 use log::{error, info};
@@ -93,19 +91,25 @@ fn main() -> anyhow::Result<()> {
         portid: ublox::UartPortId::Uart1,
         reserved0: 0,
         tx_ready: 0,
-        mode: ublox::UartMode::new(ublox::DataBits::Eight, ublox::Parity::None, ublox::StopBits::One),
+        mode: ublox::UartMode::new(
+            ublox::DataBits::Eight,
+            ublox::Parity::None,
+            ublox::StopBits::One,
+        ),
         baud_rate: TARGET_BAUDRATE,
         in_proto_mask: ublox::InProtoMask::all(),
         out_proto_mask: ublox::OutProtoMask::UBLOX,
         flags: 0,
         reserved5: 0,
-    }.into_packet_bytes();
+    }
+    .into_packet_bytes();
     gps_uart.write(&gps_init_packet)?;
     let nav5_init_packet = ublox::CfgNav5Builder {
         mask: ublox::CfgNav5Params::DYN,
         dyn_model: ublox::CfgNav5DynModel::Automotive,
         ..Default::default()
-    }.into_packet_bytes();
+    }
+    .into_packet_bytes();
     gps_uart.write(&nav5_init_packet)?;
     gps_uart.wait_tx_done(1000)?;
     gps_uart.change_baudrate(TARGET_BAUDRATE.Hz())?;
@@ -114,9 +118,11 @@ fn main() -> anyhow::Result<()> {
         measure_rate_ms: 500,
         nav_rate: 1,
         time_ref: ublox::AlignmentToReferenceTime::Utc,
-    }.into_packet_bytes();
+    }
+    .into_packet_bytes();
     gps_uart.write(&gps_rate_init)?;
-    let nav_pvt_rate_init = ublox::CfgMsgSinglePortBuilder::set_rate_for::<ublox::NavPvt>(1).into_packet_bytes();
+    let nav_pvt_rate_init =
+        ublox::CfgMsgSinglePortBuilder::set_rate_for::<ublox::NavPvt>(1).into_packet_bytes();
     gps_uart.write(&nav_pvt_rate_init)?;
 
     let mut gps_parser = ublox::Parser::default();
@@ -163,4 +169,3 @@ fn main() -> anyhow::Result<()> {
     //    esp_restart();
     //}
 }
-
