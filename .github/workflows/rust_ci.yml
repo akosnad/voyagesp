@@ -36,5 +36,13 @@ jobs:
           ldproxy: true
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
+      - name: Create dummy config.yml
+        run: |
+          cat << EOF > config.yml
+          mqtt_endpoint: mqtt://nowhere.to.be.found.arpa
+          availibility_topic: none
+          ota_topic: none
+          entities: []
+          EOF
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
