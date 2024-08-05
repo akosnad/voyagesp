@@ -39,8 +39,8 @@ jobs:
       - name: Create dummy config.yml
         run: |
           cat << EOF > config.yml
-          mqtt_endpoint: mqtt://nowhere.to.be.found.arpa
-          availibility_topic: none
+          mqtt_endpoint: mqtt://nowhere.arpa
+          availability_topic: none
           ota_topic: none
           entities: []
           EOF
