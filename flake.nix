@@ -1,68 +1,105 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    crane.url = "github:ipetkov/crane/v0.19.0";
+    esp-dev = {
+      url = "github:mirrexagon/nixpkgs-esp-dev";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, fenix, ... }:
-    flake-utils.lib.eachDefaultSystem
+  outputs = { self, nixpkgs, flake-utils, fenix, esp-dev, crane, ... }:
+    {
+      overlays.default = import ./nix/overlay.nix;
+    }
+    // flake-utils.lib.eachDefaultSystem
       (system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ fenix.overlays.default ];
-          };
+          overlays = [
+            fenix.overlays.default
+            esp-dev.overlays.default
+            self.overlays.default
+          ];
 
-          fhs = pkgs.buildFHSUserEnv {
-            name = "fhs-shell";
-            targetPkgs = pkgs: with pkgs; [
-              gcc
+          pkgs = import nixpkgs { inherit system overlays; };
 
-              pkg-config
-              libclang.lib
-              gnumake
-              cmake
-              ninja
+          rustToolchain = with fenix.packages.${system}; combine [
+            pkgs.rust-esp
+            pkgs.rust-src-esp
+          ];
 
-              git
-              wget
+          craneLib = crane.mkLib pkgs;
+          craneToolchain = craneLib.overrideToolchain rustToolchain;
+          src = craneLib.cleanCargoSource ./.;
+          commonArgs = {
+            inherit src;
+            cargoVendorDir = craneLib.vendorMultipleCargoDeps {
+              cargoLockList = [
+                ./Cargo.lock
 
-              rustup
-              cargo-generate
-              espup
-              ldproxy
+                # Unfortunately this approach requires IFD (import-from-derivation)
+                # otherwise Nix will refuse to read the Cargo.lock from our toolchain
+                # (unless we build with `--impure`).
+                #
+                # Another way around this is to manually copy the rustlib `Cargo.lock`
+                # to the repo and import it with `./path/to/rustlib/Cargo.lock` which
+                # will avoid IFD entirely but will require manually keeping the file
+                # up to date!
+                "${pkgs.rust-src-esp}/lib/rustlib/src/rust/Cargo.lock"
+              ];
+            };
 
-              espflash
-              python3
-              python3Packages.pip
-              python3Packages.virtualenv
+            strictDeps = true;
+            doCheck = false;
+            dontPatchELF = true;
 
-              rust-analyzer
+            cargoExtraArgs = "-Zbuild-std=core,alloc --target xtensa-esp32-none-elf";
 
-              mosquitto
+            nativeBuildInputs = with pkgs; [
+              esp-idf-esp32
             ];
           };
+
+          cargoArtifacts = craneToolchain.buildDepsOnly commonArgs;
+
+          crate = craneToolchain.buildPackage (commonArgs // {
+            inherit cargoArtifacts;
+          });
         in
         {
-          devShells.fhs = fhs.env;
-          devShells.default = pkgs.mkShell {
-            name = "default";
+          devShells.default = with pkgs; mkShell {
             buildInputs = [
-              (pkgs.fenix.complete.withComponents [
-                "cargo"
-                "clippy"
-                "rust-src"
-                "rustc"
-                "rustfmt"
-              ])
-              pkgs.rust-analyzer-nightly
+              openssl
+              pkg-config
+              esp-idf-esp32
+
+              rustToolchain
+
+              cargo-generate
+              cargo-espflash
             ];
           };
-          formatter = pkgs.nixpkgs-fmt;
-        }
-      );
+
+          packages.default = crate;
+
+          apps.default = {
+            type = "app";
+            program = pkgs.lib.getExe (pkgs.writeShellApplication {
+              name = "espflash-run";
+              runtimeInputs = [
+                crate
+                pkgs.espflash
+              ];
+              text = ''
+                espflash flash --monitor "${crate}/bin/${crate.pname}"
+              '';
+            });
+          };
+        });
 }
