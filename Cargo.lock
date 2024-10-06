@@ -376,6 +376,7 @@ dependencies = [
  "embedded-can",
  "embedded-hal",
  "embedded-hal-nb",
+ "embedded-io",
  "enumset",
  "esp-build",
  "esp-hal-procmacros",
@@ -1129,6 +1130,7 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 name = "voyagesp"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axp192",
  "embedded-io",
  "esp-alloc",
