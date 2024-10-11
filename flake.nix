@@ -1,7 +1,7 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts.url = "github:hercules-ci/flake-parts";
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -10,16 +10,36 @@
     esp-dev = {
       url = "github:mirrexagon/nixpkgs-esp-dev";
       inputs.nixpkgs.follows = "nixpkgs";
-      inputs.flake-utils.follows = "flake-utils";
     };
+    treefmt-nix.url = "github:numtide/treefmt-nix";
   };
 
-  outputs = { self, nixpkgs, flake-utils, fenix, esp-dev, crane, ... }:
-    {
-      overlays.default = import ./nix/overlay.nix;
-    }
-    // flake-utils.lib.eachDefaultSystem
-      (system:
+  outputs =
+    inputs@{
+      self,
+      nixpkgs,
+      flake-parts,
+      fenix,
+      esp-dev,
+      crane,
+      ...
+    }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [
+        inputs.treefmt-nix.flakeModule
+      ];
+
+      flake = {
+        overlays.default = import ./nix/overlay.nix;
+      };
+      systems = [ "x86_64-linux" ];
+      perSystem =
+        {
+          config,
+          self',
+          system,
+          ...
+        }:
         let
           overlays = [
             fenix.overlays.default
@@ -29,10 +49,12 @@
 
           pkgs = import nixpkgs { inherit system overlays; };
 
-          rustToolchain = with fenix.packages.${system}; combine [
-            pkgs.rust-esp
-            pkgs.rust-src-esp
-          ];
+          rustToolchain =
+            with fenix.packages.${system};
+            combine [
+              pkgs.rust-esp
+              pkgs.rust-src-esp
+            ];
 
           craneLib = crane.mkLib pkgs;
           craneToolchain = craneLib.overrideToolchain rustToolchain;
@@ -68,38 +90,54 @@
 
           cargoArtifacts = craneToolchain.buildDepsOnly commonArgs;
 
-          crate = craneToolchain.buildPackage (commonArgs // {
-            inherit cargoArtifacts;
-          });
+          crate = craneToolchain.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+            }
+          );
         in
         {
-          devShells.default = with pkgs; mkShell {
-            buildInputs = [
-              openssl
-              pkg-config
-              esp-idf-esp32
+          devShells.default =
+            with pkgs;
+            mkShell {
+              buildInputs = [
+                openssl
+                pkg-config
+                esp-idf-esp32
 
-              rustToolchain
+                rustToolchain
 
-              cargo-generate
-              cargo-espflash
-            ];
+                cargo-generate
+                cargo-espflash
+              ];
+            };
+
+          treefmt = {
+            projectRootFile = "Cargo.toml";
+            programs = {
+              nixfmt.enable = true;
+              rustfmt.enable = true;
+            };
           };
 
           packages.default = crate;
 
           apps.default = {
             type = "app";
-            program = pkgs.lib.getExe (pkgs.writeShellApplication {
-              name = "espflash-run";
-              runtimeInputs = [
-                crate
-                pkgs.espflash
-              ];
-              text = ''
-                espflash flash --monitor "${crate}/bin/${crate.pname}"
-              '';
-            });
+            program = pkgs.lib.getExe (
+              pkgs.writeShellApplication {
+                name = "espflash-run";
+                runtimeInputs = [
+                  crate
+                  pkgs.espflash
+                ];
+                text = ''
+                  espflash flash --monitor "${crate}/bin/${crate.pname}"
+                '';
+              }
+            );
           };
-        });
+        };
+    };
 }

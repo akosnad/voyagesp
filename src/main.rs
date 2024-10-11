@@ -6,8 +6,13 @@ use anyhow::anyhow;
 use embedded_io::{Read, ReadReady, Write};
 use esp_backtrace as _;
 use esp_hal::{
-    clock::ClockControl, delay::Delay, gpio::{Io, Level, Output}, peripherals::Peripherals, prelude::*,
-    system::SystemControl, uart,
+    clock::ClockControl,
+    delay::Delay,
+    gpio::{Io, Level, Output},
+    peripherals::Peripherals,
+    prelude::*,
+    system::SystemControl,
+    uart,
 };
 use log::info;
 
@@ -102,7 +107,13 @@ fn main() -> ! {
     let mut modem_pwrkey = Output::new(io.pins.gpio4, Level::Low);
     let mut modem_power_on = Output::new(io.pins.gpio25, Level::Low);
 
-    modem_init(&mut modem_uart, &mut modem_pwrkey, &mut modem_power_on, &delay).expect("Failed to initialize modem");
+    modem_init(
+        &mut modem_uart,
+        &mut modem_pwrkey,
+        &mut modem_power_on,
+        &delay,
+    )
+    .expect("Failed to initialize modem");
 
     let gps_buf = Vec::<u8>::new();
     let mut gps_parser = ublox::Parser::new(gps_buf);
@@ -285,7 +296,8 @@ where
 
     info!("Modem powered on, initializing...");
 
-    uart.flush_tx().map_err(|e| anyhow!("Failed to flush modem TX: {:?}", e))?;
+    uart.flush_tx()
+        .map_err(|e| anyhow!("Failed to flush modem TX: {:?}", e))?;
 
     write!(uart, "AT\r\n").map_err(|e| anyhow!("Failed to write AT command: {:?}", e))?;
     modem_expect_ack(uart, delay)?;
@@ -309,7 +321,9 @@ where
             anyhow::bail!("Timed out while initializing modem");
         }
 
-        let ready = uart.read_ready().map_err(|e| anyhow!("Failed to check UART read ready: {:?}", e))?;
+        let ready = uart
+            .read_ready()
+            .map_err(|e| anyhow!("Failed to check UART read ready: {:?}", e))?;
         if !ready {
             delay.delay_millis(10);
             i += 1;
@@ -326,7 +340,7 @@ where
         log::info!("Modem response: {}", response);
 
         if response.contains("OK") {
-            return Ok(())
+            return Ok(());
         }
     }
 }

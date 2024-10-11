@@ -1,10 +1,14 @@
-{ lib
-, stdenv
-, fetchurl
-, zlib
+{
+  lib,
+  stdenv,
+  fetchurl,
+  zlib,
 }:
 let
-  libPath = lib.makeLibraryPath [ zlib stdenv.cc.cc.lib ];
+  libPath = lib.makeLibraryPath [
+    zlib
+    stdenv.cc.cc.lib
+  ];
 in
 stdenv.mkDerivation rec {
   pname = "rust-src-esp";
