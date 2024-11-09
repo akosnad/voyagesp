@@ -59,7 +59,7 @@
           craneLib = crane.mkLib pkgs;
           craneToolchain = craneLib.overrideToolchain rustToolchain;
           src = craneLib.cleanCargoSource ./.;
-          commonArgs = {
+          commonArgs = rec {
             inherit src;
             cargoVendorDir = craneLib.vendorMultipleCargoDeps {
               cargoLockList = [
@@ -79,13 +79,17 @@
 
             strictDeps = true;
             doCheck = false;
+            dontCheck = true;
             dontPatchELF = true;
 
             cargoExtraArgs = "-Zbuild-std=core,alloc --target xtensa-esp32-none-elf";
 
-            nativeBuildInputs = with pkgs; [
+            buildInputs = with pkgs; [
+              openssl
+              pkg-config
               esp-idf-esp32
             ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ [ rustToolchain ]);
           };
 
           cargoArtifacts = craneToolchain.buildDepsOnly commonArgs;
