@@ -13,6 +13,7 @@ pub struct GpsCoords {
     lon: f64,
     height: f64,
     horiz_accuracy: u32,
+    satellite_count: u8,
 }
 
 impl From<ublox::NavPvtRef<'_>> for GpsCoords {
@@ -22,32 +23,64 @@ impl From<ublox::NavPvtRef<'_>> for GpsCoords {
             lon: nav.lon_degrees(),
             height: nav.height_meters(),
             horiz_accuracy: nav.horiz_accuracy(),
+            satellite_count: nav.num_satellites(),
         }
     }
+}
+
+#[derive(Debug, Default)]
+enum GpsState {
+    #[default]
+    Uninitialized,
+    Initializing,
+    Ready,
 }
 
 type GpsUart = Uart<'static, UART1, Async>;
 
 pub struct Gps<const BAUD: u32> {
+    state: Arc<Mutex<CriticalSectionRawMutex, GpsState>>,
     uart: Arc<Mutex<CriticalSectionRawMutex, GpsUart>>,
     coords: Arc<Mutex<CriticalSectionRawMutex, Option<GpsCoords>>>,
 }
 
 impl<const BAUD: u32> Gps<BAUD> {
-    pub async fn new(mut uart: Uart<'static, UART1, Async>) -> Result<Self> {
-        uart_init::<_, BAUD>(&mut uart).await?;
-
+    pub async fn new(uart: GpsUart) -> Result<Self> {
         Ok(Self {
+            state: Default::default(),
             uart: Arc::new(Mutex::new(uart)),
             coords: Arc::new(Mutex::new(Default::default())),
         })
     }
 
     pub async fn get_coords(&self) -> Option<GpsCoords> {
-        *self.coords.lock().await
+        match *self.state.lock().await {
+            GpsState::Ready => *self.coords.lock().await,
+            _ => None,
+        }
     }
 
+    /// Gps stack task
+    /// Should be only called once
+    ///
+    /// # Panics
+    /// Panics if called more than once
     pub async fn run(&self) -> ! {
+        {
+            let mut state = self.state.lock().await;
+            match *state {
+                GpsState::Uninitialized => {
+                    let mut uart = self.uart.lock().await;
+                    *state = GpsState::Initializing;
+                    while let Err(e) = uart_init::<_, BAUD>(&mut uart).await {
+                        log::error!("GPS initialization failed: {:?}", e);
+                    }
+                    *state = GpsState::Ready;
+                }
+                GpsState::Initializing | GpsState::Ready => panic!("GPS task already running"),
+            }
+        }
+
         let mut parser = {
             let buf = Vec::<u8>::new();
             ublox::Parser::new(buf)
@@ -95,6 +128,9 @@ impl<const BAUD: u32> Gps<BAUD> {
     }
 }
 
+/// Initialize GPS hardware
+///  
+/// [reference](https://content.u-blox.com/sites/default/files/products/documents/u-blox8-M8_ReceiverDescrProtSpec_UBX-13003221.pdf)
 async fn uart_init<T, const BAUD: u32>(
     uart: &mut esp_hal::uart::Uart<'_, T, Async>,
 ) -> anyhow::Result<()>
@@ -102,20 +138,16 @@ where
     T: esp_hal::uart::Instance,
 {
     let gps_reset_packet = ublox::CfgRstBuilder {
-        nav_bbr_mask: ublox::NavBbrMask::all(),
+        nav_bbr_mask: ublox::NavBbrMask::empty(), // don't clear Battery Backed RAM
         reset_mode: ublox::ResetMode::ControlledSoftwareReset,
         reserved1: 0,
     }
     .into_packet_bytes();
     info!("Resetting GPS...");
-    uart.write_all(&gps_reset_packet)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to write GPS reset packet: {:?}", e))?;
-    uart.flush().await.expect("Failed to flush GPS writer");
-    uart.flush_tx().expect("Failed to flush GPS TX");
+    uart_command(uart, &gps_reset_packet, true, false).await?;
 
-    // wait for GPS to reset
-    Timer::after(Duration::from_millis(1000)).await;
+    // wait for GPS to boot up
+    Timer::after(Duration::from_millis(3000)).await;
 
     let gps_init_packet = ublox::CfgPrtUartBuilder {
         portid: ublox::UartPortId::Uart1,
@@ -134,14 +166,7 @@ where
     }
     .into_packet_bytes();
     info!("Initializing GPS...");
-    uart.write_all(&gps_init_packet)
-        .await
-        .map_err(|e| anyhow!("Failed to write GPS init packet: {:?}", e))?;
-    log::trace!("written init packet");
-    uart_expect_ack(uart)
-        .await
-        .map_err(|e| anyhow!("Failed to receive GPS ACK: {:?}", e))?;
-    log::trace!("received ack");
+    uart_command(uart, &gps_init_packet, false, true).await?;
 
     //info!("Changing GPS baud rate to {}", GPS_TARGET_BAUD);
     //uart.change_baud(GPS_TARGET_BAUD, ClockSource::Apb, &clocks);
@@ -153,38 +178,51 @@ where
     }
     .into_packet_bytes();
     info!("Setting GPS to automotive mode");
-    uart.write_all(&nav5_init_packet)
-        .await
-        .map_err(|e| anyhow!("Failed to write NAV5 init packet: {:?}", e))?;
-    uart_expect_ack(uart)
-        .await
-        .map_err(|_| anyhow!("Failed to receive GPS ACK"))?;
+    uart_command(uart, &nav5_init_packet, false, true).await?;
 
     let gps_rate_init = ublox::CfgRateBuilder {
-        measure_rate_ms: 500,
+        measure_rate_ms: 1000,
         nav_rate: 1,
         time_ref: ublox::AlignmentToReferenceTime::Utc,
     }
     .into_packet_bytes();
-    info!("Setting GPS rate to 500ms");
-    uart.write_all(&gps_rate_init)
-        .await
-        .map_err(|e| anyhow!("Failed to write GPS rate init packet: {:?}", e))?;
-    uart_expect_ack(uart)
-        .await
-        .map_err(|_| anyhow!("Failed to receive GPS ACK"))?;
+    info!("Setting GPS rate to 1s");
+    uart_command(uart, &gps_rate_init, false, true).await?;
 
     let nav_pvt_rate_init =
         ublox::CfgMsgSinglePortBuilder::set_rate_for::<ublox::NavPvt>(1).into_packet_bytes();
-    info!("Setting NAV-PVT rate to 1 every measurement cycle");
-    uart.write_all(&nav_pvt_rate_init)
-        .await
-        .map_err(|e| anyhow!("Failed to write NAV-PVT rate init packet: {:?}", e))?;
-    uart_expect_ack(uart)
-        .await
-        .map_err(|_| anyhow!("Failed to receive GPS ACK"))?;
+    info!("Setting GPS NAV-PVT rate to 1 every measurement cycle");
+    uart_command(uart, &nav_pvt_rate_init, false, true).await?;
 
     info!("GPS initialized");
+    Ok(())
+}
+
+async fn uart_command<T>(
+    uart: &mut esp_hal::uart::Uart<'_, T, Async>,
+    cmd: &[u8],
+    flush: bool,
+    expect_ack: bool,
+) -> anyhow::Result<()>
+where
+    T: esp_hal::uart::Instance,
+{
+    uart.write_all(cmd)
+        .await
+        .map_err(|e| anyhow!("Failed to write GPS command: {:?}", e))?;
+
+    if flush {
+        uart.flush()
+            .await
+            .map_err(|e| anyhow!("Failed to flush GPS UART: {:?}", e))?;
+    }
+
+    if expect_ack {
+        uart_expect_ack(uart)
+            .await
+            .map_err(|e| anyhow!("Failed to receive GPS ACK: {:?}", e))?;
+    }
+
     Ok(())
 }
 
@@ -193,7 +231,7 @@ where
     T: esp_hal::uart::Instance,
 {
     const BUF_SIZE: usize = 128;
-    const MAX_ITERATIONS: usize = 1000;
+    const MAX_ITERATIONS: usize = 500;
     let mut parser = ublox::Parser::new(Vec::new());
 
     let mut i = 0;

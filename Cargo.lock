@@ -30,6 +30,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "atat"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d0925fc7a5960d46ff5e9f1baac9e9b57afb4c90d889ffa6fd3064b69343a9e"
+dependencies = [
+ "atat_derive",
+ "embassy-sync 0.6.0",
+ "embassy-time",
+ "embedded-io",
+ "embedded-io-async",
+ "futures",
+ "heapless 0.8.0",
+ "heapless-bytes",
+ "log",
+ "nom",
+ "serde_at",
+ "serde_bytes",
+]
+
+[[package]]
+name = "atat_derive"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49d2402cac9a5975397460c95ca438ac5f39f1b80903649de73bf7fe0dbb4940"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_at",
+ "syn 2.0.79",
+]
+
+[[package]]
 name = "atomic-polyfill"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,7 +140,7 @@ dependencies = [
  "embedded-io",
  "embedded-io-async",
  "futures-intrusive",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -246,7 +278,7 @@ dependencies = [
  "embedded-nal-async",
  "futures",
  "generic-array 0.14.7",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "managed",
  "smoltcp",
@@ -269,7 +301,7 @@ dependencies = [
  "critical-section",
  "embedded-io-async",
  "futures-util",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -282,7 +314,7 @@ dependencies = [
  "critical-section",
  "embedded-io-async",
  "futures-util",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -300,7 +332,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "futures-util",
- "heapless",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -616,7 +648,7 @@ dependencies = [
  "esp-metadata",
  "esp-wifi-sys",
  "fugit",
- "heapless",
+ "heapless 0.8.0",
  "libm",
  "log",
  "no-std-net",
@@ -783,6 +815,15 @@ dependencies = [
 
 [[package]]
 name = "hash32"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c35f58762feb77d74ebe43bdbc3210f09be9fe6742234d573bacc26ed92b67"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
+name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
@@ -798,13 +839,38 @@ checksum = "1e087f84d4f86bf4b218b927129862374b72199ae7d8657835f1e89000eea4fb"
 
 [[package]]
 name = "heapless"
+version = "0.7.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdc6457c0eb62c71aac4bc17216026d8410337c4126773b9c5daba343f17964f"
+dependencies = [
+ "atomic-polyfill",
+ "hash32 0.2.1",
+ "rustc_version",
+ "spin",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
- "hash32",
+ "hash32 0.3.1",
  "portable-atomic",
+ "serde",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless-bytes"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7285eba272c6af3e9f15fb9e1c1b6e7d35aa70580ffe0d47af017e97dfb6f48b"
+dependencies = [
+ "heapless 0.7.17",
+ "serde",
+ "typenum",
 ]
 
 [[package]]
@@ -894,6 +960,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "mutex-trait"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,6 +991,16 @@ name = "no-std-net"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
+]
 
 [[package]]
 name = "num-derive"
@@ -1068,6 +1150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,12 +1183,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f69d4d7b8d5f6595ac8901b8c4ede3339b1b4c8565f9d3180d20fc046cca177"
 
 [[package]]
+name = "semver"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61697e0a1c7e512e84a621326239844a24d8207b4669b41bc18b32ea5cbf988b"
+
+[[package]]
 name = "serde"
 version = "1.0.210"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8e3592472072e6e22e0a54d5904d9febf8508f65fb8552499a1abc7d1078c3a"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde_at"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf0ea3b59853445d3b52d8c6b4399a254443dd62178ee19c8dd8d3d6e3f9d084"
+dependencies = [
+ "heapless 0.8.0",
+ "heapless-bytes",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "387cc504cb06bb40a96c8e04e951fe01854cf6bc921053c954e4a606d9675c6a"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1133,6 +1251,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "smoltcp"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1141,7 +1272,7 @@ dependencies = [
  "bitflags 1.3.2",
  "byteorder",
  "cfg-if",
- "heapless",
+ "heapless 0.8.0",
  "managed",
 ]
 
@@ -1305,6 +1436,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91b56cd4cadaeb79bbf1a5645f6b4f8dc5bde8834ad5894a8db35fda9efa1fe"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "vcell"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1327,8 +1464,10 @@ name = "voyagesp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atat",
  "axp192",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-sync 0.6.0",
  "embassy-time",
@@ -1340,10 +1479,11 @@ dependencies = [
  "esp-hal-embassy",
  "esp-println",
  "esp-wifi",
- "heapless",
+ "heapless 0.8.0",
  "log",
  "serde",
  "serde_json",
+ "serde_yaml",
  "smoltcp",
  "static_cell",
  "ublox",

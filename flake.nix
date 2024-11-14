@@ -59,7 +59,7 @@
           craneLib = crane.mkLib pkgs;
           craneToolchain = craneLib.overrideToolchain rustToolchain;
           src = craneLib.cleanCargoSource ./.;
-          commonArgs = rec {
+          commonArgs = {
             inherit src;
             cargoVendorDir = craneLib.vendorMultipleCargoDeps {
               cargoLockList = [
@@ -87,9 +87,17 @@
             buildInputs = with pkgs; [
               openssl
               pkg-config
-              esp-idf-esp32
+              esp-idf-esp32-with-clang
             ];
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ [ rustToolchain ]);
+
+            # FIXME: this is a hack for cargo to find our linker
+            CARGO_TARGET_XTENSA_ESP32_NONE_ELF_LINKER =
+              let
+                deps = pkgs.esp-idf-esp32-with-clang.propagatedBuildInputs;
+                idfName = pkgs.esp-idf-esp32-with-clang.name;
+                targetPkg = builtins.head (builtins.filter (p: p.name == "esp-clang-${idfName}") deps);
+              in
+              "${targetPkg}/bin/xtensa-esp32-elf-ld";
           };
 
           cargoArtifacts = craneToolchain.buildDepsOnly commonArgs;
@@ -108,7 +116,7 @@
               buildInputs = [
                 openssl
                 pkg-config
-                esp-idf-esp32
+                esp-idf-esp32-with-clang
 
                 rustToolchain
 

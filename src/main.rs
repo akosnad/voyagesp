@@ -3,21 +3,22 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 
-use alloc::boxed::Box;
-use anyhow::anyhow;
+use alloc::{boxed::Box, sync::Arc};
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
 use embassy_net::StackResources;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
-use embedded_io_async::{Read as _, ReadReady as _, Write as _};
+use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
 use esp_hal::{
-    gpio::{Io, Output},
+    gpio::{Input, Io, Output},
+    peripherals::{UART0, UART2},
     prelude::*,
     reset::software_reset,
     rng::Rng,
-    uart, Async,
+    uart::{self, UartRx, UartTx},
+    Async,
 };
 use esp_hal_embassy::main;
 use esp_wifi::{
@@ -34,15 +35,18 @@ use static_cell::make_static;
 extern crate alloc;
 
 mod gps;
+mod modem;
 
 use gps::Gps;
 
 #[export_name = "custom_halt"]
 pub fn custom_halt() -> ! {
     loop {
-        software_reset();
+        //software_reset();
     }
 }
+
+const GPS_BAUD: u32 = 9600;
 
 #[main]
 async fn main_task(spawner: Spawner) {
@@ -52,7 +56,7 @@ async fn main_task(spawner: Spawner) {
 
     esp_alloc::heap_allocator!(72 * 1024);
 
-    esp_println::logger::init_logger_from_env();
+    esp_println::logger::init_logger(log::LevelFilter::Debug);
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
@@ -115,7 +119,6 @@ async fn main_task(spawner: Spawner) {
     //    Timer::after(Duration::from_millis(500)).await;
     //}
 
-    const GPS_BAUD: u32 = 9600;
     let gps_uart = esp_hal::uart::Uart::new_async_with_config(
         peripherals.UART1,
         uart::config::Config {
@@ -126,8 +129,8 @@ async fn main_task(spawner: Spawner) {
             rx_timeout: Some(50),
             ..Default::default()
         },
-        io.pins.gpio34,
-        io.pins.gpio32,
+        io.pins.gpio13,
+        io.pins.gpio15,
     )
     .expect("Failed to initialize GPS UART");
 
@@ -141,10 +144,16 @@ async fn main_task(spawner: Spawner) {
         .spawn(gps_task(gps))
         .expect("Failed to spawn GPS task");
 
-    let status_chan = channel::Channel::<NoopRawMutex, StatusEvent, 3>::new();
+    // let status_chan = channel::Channel::<NoopRawMutex, StatusEvent, 3>::new();
+
+    let modem_dtr = Output::new(io.pins.gpio32, esp_hal::gpio::Level::Low);
+    let modem_ri = Input::new(io.pins.gpio33, esp_hal::gpio::Pull::None);
+
+    let modem_pwrkey = Output::new(io.pins.gpio4, esp_hal::gpio::Level::Low);
+    let modem_power_on = Output::new(io.pins.gpio25, esp_hal::gpio::Level::Low);
 
     const MODEM_BAUD: u32 = 115_200;
-    let mut modem_uart = esp_hal::uart::Uart::new_async_with_config(
+    let modem_uart = esp_hal::uart::Uart::new_async_with_config(
         peripherals.UART2,
         uart::config::Config {
             baudrate: MODEM_BAUD,
@@ -159,20 +168,126 @@ async fn main_task(spawner: Spawner) {
     )
     .expect("Failed to initialize modem UART");
 
-    let mut modem_pwrkey = Output::new(io.pins.gpio4, esp_hal::gpio::Level::Low);
-    let mut modem_power_on = Output::new(io.pins.gpio25, esp_hal::gpio::Level::Low);
+    //let mut modem_interface = modem::ModemInterface {
+    //    uart: modem_uart,
+    //    dtr: modem_dtr,
+    //    ri: modem_ri,
+    //    pwrkey: modem_pwrkey,
+    //    power_on: modem_power_on,
+    //};
+    //modem::modem_init(&mut modem_interface).await.expect("Failed to initialize modem");
 
-    modem_init(&mut modem_uart, &mut modem_pwrkey, &mut modem_power_on)
+    //let mut usb_uart = esp_hal::uart::Uart::new_async_with_config(
+    //    peripherals.UART0,
+    //    uart::config::Config {
+    //        baudrate: 115_200,
+    //        data_bits: uart::config::DataBits::DataBits8,
+    //        parity: uart::config::Parity::ParityNone,
+    //        stop_bits: uart::config::StopBits::STOP1,
+    //        rx_timeout: Some(50),
+    //        ..Default::default()
+    //    },
+    //    io.pins.gpio3,
+    //    io.pins.gpio1,
+    //).expect("Failed to initialize USB UART");
+
+    //usb_uart.write_all(b"Hello, world!\r\n").await.expect("Failed to write to USB UART");
+
+    //let (usb_rx, usb_tx) = usb_uart.split();
+    //let (modem_rx, modem_tx) = modem_interface.uart.split();
+
+    //let usb_tx: UsbTx = Arc::new(Mutex::new(usb_tx));
+
+    //spawner.spawn(usb_reader(usb_rx, modem_tx, usb_tx.clone())).expect("Failed to spawn USB reader task");
+    //spawner.spawn(modem_reader(modem_rx, usb_tx)).expect("Failed to spawn modem reader task");
+
+    let modem = {
+        let modem = modem::Modem::new(
+            &spawner,
+            modem_uart,
+            modem_dtr,
+            modem_ri,
+            modem_pwrkey,
+            modem_power_on,
+        )
         .await
         .expect("Failed to initialize modem");
+        make_static!(modem)
+    };
+    spawner
+        .spawn(modem_task(modem))
+        .expect("Failed to spawn modem task");
 
     loop {
-        Timer::after(Duration::from_secs(1)).await;
+        Timer::after(Duration::from_secs(5)).await;
+        //if let Err(e) = modem_uart.write(b"AT+CSQ\r\n").await {
+        //    log::error!("Failed to write AT command: {:?}", e);
+        //}
+        //modem_ri.wait_for_high().await;
+        //let mut buf = [0u8; 512];
+        //match modem_uart.read(&mut buf).await {
+        //    Ok(len) => {
+        //        if let Ok(response) = core::str::from_utf8(&buf[..len]) {
+        //            log::info!("Modem response: {}", response);
+        //        } else {
+        //            log::error!("Failed to parse modem response");
+        //        }
+        //    }
+        //    Err(e) => {
+        //        log::error!("GPS Read failed: {:?}", e);
+        //        continue;
+        //    }
+        //};
         info!("gps coords: {:?}", gps.get_coords().await);
     }
 }
 
-enum StatusEvent {}
+type UsbTx = Arc<Mutex<CriticalSectionRawMutex, UartTx<'static, UART0, Async>>>;
+
+#[task]
+async fn usb_reader(
+    mut usb_rx: UartRx<'static, UART0, Async>,
+    mut modem_tx: UartTx<'static, UART2, Async>,
+    usb_tx: UsbTx,
+) -> ! {
+    loop {
+        let mut buf = [0u8; 512];
+        let len = usb_rx
+            .read(&mut buf)
+            .await
+            .expect("Failed to read from USB UART");
+        modem_tx
+            .write_all(&buf[..len])
+            .await
+            .expect("Failed to write to modem UART");
+        usb_tx
+            .lock()
+            .await
+            .write_all(&buf[..len])
+            .await
+            .expect("Failed to write to USB UART");
+    }
+}
+
+#[task]
+async fn modem_reader(mut modem_rx: UartRx<'static, UART2, Async>, usb_tx: UsbTx) -> ! {
+    loop {
+        let mut buf = [0u8; 1024];
+        match modem_rx.read(&mut buf).await {
+            Ok(len) => {
+                usb_tx
+                    .lock()
+                    .await
+                    .write_all(&buf[..len])
+                    .await
+                    .expect("Failed to write to USB UART");
+            }
+            Err(e) => {
+                log::error!("Modem read failed: {:?}", e);
+            }
+        }
+    }
+}
 
 #[task]
 async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
@@ -186,7 +301,8 @@ async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
 
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = Configuration::Client(ClientConfiguration {
-                ssid: heapless::String::from_str("Gaia").expect("Failed to create SSID string"),
+                ssid: heapless::String::from_str(env!("WIFI_SSID"))
+                    .expect("Failed to create SSID string"),
                 password: heapless::String::from_str(env!("WIFI_PASSWORD"))
                     .expect("Failed to create password string"),
                 ..Default::default()
@@ -219,77 +335,11 @@ async fn wifi_net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, Wi
 }
 
 #[task]
-async fn gps_task(gps: &'static Gps<9600>) {
+async fn gps_task(gps: &'static Gps<GPS_BAUD>) {
     gps.run().await;
 }
 
-async fn modem_init<T, PK, PO>(
-    uart: &mut esp_hal::uart::Uart<'_, T, Async>,
-    pwrkey: &mut esp_hal::gpio::Output<'_, PK>,
-    power_on: &mut esp_hal::gpio::Output<'_, PO>,
-) -> anyhow::Result<()>
-where
-    T: esp_hal::uart::Instance,
-    PK: esp_hal::gpio::OutputPin,
-    PO: esp_hal::gpio::OutputPin,
-{
-    info!("Resetting modem...");
-
-    power_on.set_high();
-    pwrkey.set_high();
-    Timer::after(Duration::from_millis(100)).await;
-    pwrkey.set_low();
-    Timer::after(Duration::from_millis(1_000)).await;
-    pwrkey.set_high();
-
-    Timer::after(Duration::from_millis(8_000)).await;
-
-    info!("Modem powered on, initializing...");
-
-    uart.flush_tx()
-        .map_err(|e| anyhow!("Failed to flush modem TX: {:?}", e))?;
-
-    uart.write(b"AT\r\n")
-        .await
-        .map_err(|e| anyhow!("Failed to write AT command: {:?}", e))?;
-    modem_expect_ack(uart).await?;
-
-    Ok(())
-}
-
-async fn modem_expect_ack<T>(uart: &mut esp_hal::uart::Uart<'_, T, Async>) -> anyhow::Result<()>
-where
-    T: esp_hal::uart::Instance,
-{
-    const MAX_ITERATIONS: usize = 100;
-    let mut i = 0;
-
-    loop {
-        if i >= MAX_ITERATIONS {
-            anyhow::bail!("Timed out while initializing modem");
-        }
-
-        let ready = uart
-            .read_ready()
-            .map_err(|e| anyhow!("Failed to check UART read ready: {:?}", e))?;
-        if !ready {
-            Timer::after(Duration::from_millis(10)).await;
-            i += 1;
-            continue;
-        }
-
-        let mut buf = [0u8; 256];
-        let len = uart
-            .read(&mut buf)
-            .await
-            .map_err(|e| anyhow!("Failed to read modem response: {:?}", e))?;
-
-        let response = core::str::from_utf8(&buf[..len])
-            .map_err(|e| anyhow!("Failed to parse modem response: {:?}", e))?;
-        log::info!("Modem response: {}", response);
-
-        if response.contains("OK") {
-            return Ok(());
-        }
-    }
+#[task]
+async fn modem_task(modem: &'static modem::Modem) {
+    modem.run().await;
 }
