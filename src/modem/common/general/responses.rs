@@ -1,7 +1,18 @@
+use alloc::string::String;
 use atat::atat_derive::AtatResp;
-use atat::heapless::String;
 
 #[derive(Clone, Debug, AtatResp)]
 pub struct Manufacturer {
-    pub id: atat::heapless_bytes::Bytes<64>,
+    pub id: String,
+}
+
+#[derive(Clone, Debug, AtatResp)]
+pub struct Model {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, AtatResp)]
+pub struct SignalQuality {
+    pub rssi: u8,
+    pub ber: u8,
 }

@@ -1,9 +1,11 @@
+use core::str::FromStr;
+
 use alloc::sync::Arc;
 use anyhow::anyhow;
 use atat::{asynch::AtatClient, AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel};
 use embassy_executor::task;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, TimeoutError, Timer, WithTimeout};
 use esp_hal::{
     gpio::{AnyPin, Input, Output},
     peripherals::UART2,
@@ -13,6 +15,8 @@ use esp_hal::{
 use log::info;
 use static_cell::StaticCell;
 
+use crate::modem::common::general::urc::PinStatus;
+
 mod common;
 
 type ModemUart = Uart<'static, UART2, Async>;
@@ -20,12 +24,15 @@ type ModemRx = UartRx<'static, UART2, Async>;
 type ModemTx = UartTx<'static, UART2, Async>;
 type ModemClient = atat::asynch::Client<'static, ModemTx, INGRESS_BUF_SIZE>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 enum ModemState {
     #[default]
     Uninitialized,
     Initializing,
     HardwareReady,
+    SimReady,
+    SimOnline,
+    GprsOnline,
 }
 
 pub struct ModemInterface {
@@ -37,7 +44,7 @@ pub struct ModemInterface {
 }
 
 const INGRESS_BUF_SIZE: usize = 1024;
-const URC_CAPACITY: usize = 512;
+const URC_CAPACITY: usize = 1024;
 const URC_SUBSCRIBERS: usize = 3;
 
 static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
@@ -103,19 +110,111 @@ impl Modem {
         }
         let mut int = self.interface.lock().await;
 
-        let at = int.client.send(&common::AT).await;
-        log::info!("Initial AT ping response: {:?}", at);
-
-        self.dump_info(&mut int)
-            .await
-            .expect("Failed to dump modem info");
-
         let mut urc_subcriber = URC_CHANNEL
             .subscribe()
             .expect("Failed to subscribe to URC channel");
+
+        int.client
+            .send(&common::general::EnableGetLocalTimestamp { enable: 1 })
+            .await
+            .expect("Failed to enable local timestamp reporting");
+
+        self.dump_info(&mut int)
+            .await
+            .map_err(|e| log::error!("Failed to dump info: {:?}", e))
+            .ok();
+
         loop {
-            let urc = urc_subcriber.next_message().await;
-            log::info!("Received URC: {:?}", urc);
+            let future = urc_subcriber
+                .next_message()
+                .with_timeout(Duration::from_secs(3));
+            if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
+                self.handle_urc(&mut int, urc)
+                    .await
+                    .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
+                    .ok();
+            }
+
+            // self.dump_status(&mut int)
+            //     .await
+            //     .map_err(|e| log::error!("Failed to dump status: {:?}", e)).ok();
+
+            {
+                let mut state_guard = self.state.lock().await;
+                let pending_state = state_guard.clone();
+
+                if let Ok(next_state) = self.handle_state_change(&mut int, pending_state).await {
+                    *state_guard = next_state;
+                }
+            }
+        }
+    }
+
+    async fn handle_urc(&self, int: &mut ModemInterface, urc: common::Urc) -> anyhow::Result<()> {
+        match urc {
+            common::Urc::IndicatorEvent(e) => {
+                log::info!("Indicator event: {:?}", e);
+                let mut state = self.state.lock().await;
+                if let ModemState::SimReady = *state {
+                    if e.rdy == 0 {
+                        *state = ModemState::SimOnline;
+                    }
+                }
+            }
+            common::Urc::PinStatus(PinStatus { status }) => {
+                log::info!("PIN status: {}", status);
+                match status.as_str() {
+                    "READY" => {
+                        info!("SIM card ready");
+                        let mut state = self.state.lock().await;
+                        if let ModemState::HardwareReady = *state {
+                            *state = ModemState::SimReady;
+                        }
+                    }
+                    "NOT READY" => info!("SIM card not ready"),
+                    "NOT INSERTED" => info!("SIM card not inserted"),
+                    _ => anyhow::bail!("Unknown PIN status: {}", status),
+                }
+            }
+            urc => log::info!("Received URC: {:?}", urc),
+        }
+
+        Ok(())
+    }
+
+    async fn handle_state_change(
+        &self,
+        int: &mut ModemInterface,
+        current_state: ModemState,
+    ) -> anyhow::Result<ModemState> {
+        match current_state {
+            ModemState::SimOnline => {
+                int.client
+                    .send(&common::cip::SetPDPContext {
+                        cid: 1,
+                        pdp_type: heapless::String::from_str("IP").unwrap(),
+                        apn: heapless::String::from_str(env!("APN"))
+                            .map_err(|_| anyhow!("Failed to create APN string"))?,
+                    })
+                    .await
+                    .map_err(|e| anyhow!("Failed to set PDP context: {:?}", e))?;
+
+                int.client
+                    .send(&common::cip::AttachToGprsService { attach: 1 })
+                    .await
+                    .map_err(|e| anyhow!("Failed to attach to GPRS service: {:?}", e))?;
+
+                int.client
+                    .send(&common::cip::StartDataConnection {
+                        cid: 1,
+                        l2p: heapless::String::from_str("PPP").unwrap(),
+                    })
+                    .await
+                    .map_err(|e| anyhow!("Failed to bring up wireless connection: {:?}", e))?;
+
+                Ok(ModemState::GprsOnline)
+            }
+            _ => Ok(current_state),
         }
     }
 
@@ -125,9 +224,23 @@ impl Modem {
             .send(&common::general::GetManufacturerInfo)
             .await
             .map_err(|e| anyhow!("Failed to get manufacturer info: {e:?}"))?;
-        let parsed = core::str::from_utf8(&manufacturer.id)
-            .map_err(|e| anyhow!("Failed to parse manufacturer info: {e:?}"))?;
-        log::info!("Modem Manufacturer: {}", parsed);
+        log::info!("Modem Manufacturer: {}", manufacturer.id);
+
+        let model = int
+            .client
+            .send(&common::general::GetModelInfo)
+            .await
+            .map_err(|e| anyhow!("Failed to get model info: {e:?}"))?;
+        log::info!("Modem model: {}", model.id);
+
+        Ok(())
+    }
+
+    async fn dump_status(&self, int: &mut ModemInterface) -> anyhow::Result<()> {
+        match int.client.send(&common::general::GetSignalQuality).await {
+            Ok(report) => log::info!("Signal quality: {:?}", report),
+            Err(e) => log::error!("Failed to get signal quality: {e:?}"),
+        }
 
         Ok(())
     }

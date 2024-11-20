@@ -2,12 +2,14 @@
 struct Config {
     wifi_ssid: String,
     wifi_password: String,
+    apn: String,
 }
 
 impl Config {
     fn export_vars(&self) {
         println!("cargo:rustc-env=WIFI_SSID={}", self.wifi_ssid);
         println!("cargo:rustc-env=WIFI_PASSWORD={}", self.wifi_password);
+        println!("cargo:rustc-env=APN={}", self.apn);
     }
 }
 

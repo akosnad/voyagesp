@@ -70,36 +70,36 @@ async fn main_task(spawner: Spawner) {
     psu.set_dcdc2_on(false).unwrap();
     psu.set_exten_on(false).unwrap();
 
-    let wifi_init = esp_wifi::init(
-        EspWifiInitFor::Wifi,
-        timg0.timer1,
-        Rng::new(peripherals.RNG),
-        peripherals.RADIO_CLK,
-    )
-    .expect("Failed to initialize WiFi clocks");
-    let mut socket_storage: [SocketStorage; 3] = Default::default();
-    let (_wifi_interface, wifi_device, wifi_controller, _wifi_sockets) = create_network_interface(
-        &wifi_init,
-        peripherals.WIFI,
-        WifiStaDevice,
-        &mut socket_storage,
-    )
-    .expect("Failed to create WiFi network interface");
+    //   let wifi_init = esp_wifi::init(
+    //       EspWifiInitFor::Wifi,
+    //       timg0.timer1,
+    //       Rng::new(peripherals.RNG),
+    //       peripherals.RADIO_CLK,
+    //   )
+    //   .expect("Failed to initialize WiFi clocks");
+    //   let mut socket_storage: [SocketStorage; 3] = Default::default();
+    //   let (_wifi_interface, wifi_device, wifi_controller, _wifi_sockets) = create_network_interface(
+    //       &wifi_init,
+    //       peripherals.WIFI,
+    //       WifiStaDevice,
+    //       &mut socket_storage,
+    //   )
+    //   .expect("Failed to create WiFi network interface");
 
-    let stack_resources: &mut StackResources<3> = Box::leak(Box::new(StackResources::new()));
-    let stack = make_static!(embassy_net::Stack::new(
-        wifi_device,
-        embassy_net::Config::dhcpv4(Default::default()),
-        stack_resources,
-        1234u64,
-    ));
+    //   let stack_resources: &mut StackResources<3> = Box::leak(Box::new(StackResources::new()));
+    //   let stack = make_static!(embassy_net::Stack::new(
+    //       wifi_device,
+    //       embassy_net::Config::dhcpv4(Default::default()),
+    //       stack_resources,
+    //       1234u64,
+    //   ));
 
-    spawner
-        .spawn(wifi_connection(wifi_controller))
-        .expect("Failed to spawn WiFi connection task");
-    spawner
-        .spawn(wifi_net_task(stack))
-        .expect("Failed to spawn WiFi task");
+    //   spawner
+    //       .spawn(wifi_connection(wifi_controller))
+    //       .expect("Failed to spawn WiFi connection task");
+    //   spawner
+    //       .spawn(wifi_net_task(stack))
+    //       .expect("Failed to spawn WiFi task");
 
     //log::info!("Waiting for WiFi link...");
     //loop {
@@ -119,30 +119,30 @@ async fn main_task(spawner: Spawner) {
     //    Timer::after(Duration::from_millis(500)).await;
     //}
 
-    let gps_uart = esp_hal::uart::Uart::new_async_with_config(
-        peripherals.UART1,
-        uart::config::Config {
-            baudrate: GPS_BAUD,
-            data_bits: uart::config::DataBits::DataBits8,
-            parity: uart::config::Parity::ParityNone,
-            stop_bits: uart::config::StopBits::STOP1,
-            rx_timeout: Some(50),
-            ..Default::default()
-        },
-        io.pins.gpio13,
-        io.pins.gpio15,
-    )
-    .expect("Failed to initialize GPS UART");
+    //        let gps_uart = esp_hal::uart::Uart::new_async_with_config(
+    //            peripherals.UART1,
+    //            uart::config::Config {
+    //                baudrate: GPS_BAUD,
+    //                data_bits: uart::config::DataBits::DataBits8,
+    //                parity: uart::config::Parity::ParityNone,
+    //                stop_bits: uart::config::StopBits::STOP1,
+    //                rx_timeout: Some(50),
+    //                ..Default::default()
+    //            },
+    //            io.pins.gpio13,
+    //            io.pins.gpio15,
+    //        )
+    //        .expect("Failed to initialize GPS UART");
 
-    let gps = {
-        let gps = gps::Gps::new(gps_uart)
-            .await
-            .expect("Failed to initialize GPS");
-        make_static!(gps)
-    };
-    spawner
-        .spawn(gps_task(gps))
-        .expect("Failed to spawn GPS task");
+    //        let gps = {
+    //            let gps = gps::Gps::new(gps_uart)
+    //                .await
+    //                .expect("Failed to initialize GPS");
+    //            make_static!(gps)
+    //        };
+    //        spawner
+    //            .spawn(gps_task(gps))
+    //            .expect("Failed to spawn GPS task");
 
     // let status_chan = channel::Channel::<NoopRawMutex, StatusEvent, 3>::new();
 
@@ -220,25 +220,8 @@ async fn main_task(spawner: Spawner) {
 
     loop {
         Timer::after(Duration::from_secs(5)).await;
-        //if let Err(e) = modem_uart.write(b"AT+CSQ\r\n").await {
-        //    log::error!("Failed to write AT command: {:?}", e);
-        //}
-        //modem_ri.wait_for_high().await;
-        //let mut buf = [0u8; 512];
-        //match modem_uart.read(&mut buf).await {
-        //    Ok(len) => {
-        //        if let Ok(response) = core::str::from_utf8(&buf[..len]) {
-        //            log::info!("Modem response: {}", response);
-        //        } else {
-        //            log::error!("Failed to parse modem response");
-        //        }
-        //    }
-        //    Err(e) => {
-        //        log::error!("GPS Read failed: {:?}", e);
-        //        continue;
-        //    }
-        //};
-        info!("gps coords: {:?}", gps.get_coords().await);
+
+        //info!("gps coords: {:?}", gps.get_coords().await);
     }
 }
 
