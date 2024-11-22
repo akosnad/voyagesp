@@ -1,6 +1,5 @@
 use super::EmptyResponse;
-use atat::{atat_derive::AtatCmd, AtatLen};
-use serde::Serialize;
+use atat::atat_derive::AtatCmd;
 
 pub mod responses;
 use responses::*;
