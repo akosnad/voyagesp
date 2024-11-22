@@ -147,7 +147,7 @@ where
     uart_command(uart, &gps_reset_packet, true, false).await?;
 
     // wait for GPS to boot up
-    Timer::after(Duration::from_millis(3000)).await;
+    Timer::after(Duration::from_millis(6000)).await;
 
     let gps_init_packet = ublox::CfgPrtUartBuilder {
         portid: ublox::UartPortId::Uart1,

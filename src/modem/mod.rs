@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use anyhow::anyhow;
 use core::str::FromStr;
 use embassy_executor::task;
-use embassy_net_ppp::Ipv4Status;
+use embassy_net::{Ipv4Address, StaticConfigV4};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::WithTimeout as _;
 use embassy_time::{Duration, Timer};
@@ -48,7 +48,12 @@ impl Modem {
         ri: Input<'static, AnyPin>,
         pwrkey: Output<'static, AnyPin>,
         power_on: Output<'static, AnyPin>,
-        on_ipv4_up: impl FnMut(Ipv4Status) + 'static + Copy,
+        config_sender: embassy_sync::channel::Sender<
+            'static,
+            CriticalSectionRawMutex,
+            StaticConfigV4,
+            1,
+        >,
     ) -> anyhow::Result<(Self, embassy_net_ppp::Device<'static>)> {
         let (interface, data_tx, data_rx) =
             ModemInterface::new(spawner, dtr, ri, pwrkey, power_on, uart).await?;
@@ -58,7 +63,7 @@ impl Modem {
         let (ppp_device, ppp_runner) = embassy_net_ppp::new::<16, 16>(ppp_state);
 
         spawner
-            .spawn(ppp_task(data_tx, data_rx, ppp_runner, on_ipv4_up))
+            .spawn(ppp_task(data_tx, data_rx, ppp_runner, config_sender))
             .map_err(|e| anyhow!("Failed to spawn PPP task: {:?}", e))?;
 
         Ok((
@@ -227,8 +232,48 @@ async fn ppp_task(
     data_tx: interface::DataTx,
     mut data_rx: interface::DataRx,
     mut runner: embassy_net_ppp::Runner<'static>,
-    on_ipv4_up: impl FnMut(Ipv4Status) + 'static + Copy,
+    config_sender: embassy_sync::channel::Sender<
+        'static,
+        CriticalSectionRawMutex,
+        StaticConfigV4,
+        1,
+    >,
 ) {
+    let on_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
+        let Some(address) = ipv4_status.address else {
+            return;
+        };
+        let Some(gateway) = ipv4_status.peer_address else {
+            return;
+        };
+        let dns_servers: heapless::Vec<Ipv4Address, 3> = ipv4_status
+            .dns_servers
+            .iter()
+            .flatten()
+            .map(|addr| Ipv4Address::from_bytes(&addr.0))
+            .collect();
+
+        //let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> =
+        //    heapless::Vec::from_iter(vec![
+        //        embassy_net::Ipv4Address::new(1, 1, 1, 1),
+        //        embassy_net::Ipv4Address::new(1, 0, 0, 1),
+        //    ]);
+
+        let config = StaticConfigV4 {
+            address: embassy_net::Ipv4Cidr::new(
+                Ipv4Address::from_bytes(&address.0),
+                0, // no network, since we are point-to-point
+            ),
+            gateway: Some(Ipv4Address::from_bytes(&gateway.0)),
+            dns_servers,
+        };
+
+        config_sender
+            .try_send(config)
+            .map_err(|e| anyhow!("Failed to send modem ipv4 config: {:?}", e))
+            .ok();
+    };
+
     loop {
         let rw = UnifiedDataRxTx::new(&mut data_rx, &data_tx);
         let config = embassy_net_ppp::Config {

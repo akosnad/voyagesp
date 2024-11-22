@@ -3,24 +3,26 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 
-use alloc::{boxed::Box, vec};
-use anyhow::anyhow;
+use alloc::boxed::Box;
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
-use embassy_net::{ConfigV4, StackResources, StaticConfigV4};
+use embassy_net::{tcp::TcpSocket, ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Input, Io, Output},
     prelude::*,
+    rng::Rng,
     uart,
 };
 use esp_hal_embassy::main;
 use esp_wifi::wifi::{
-    ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice,
-    WifiState,
+    utils::create_network_interface, ClientConfiguration, Configuration, WifiController,
+    WifiDevice, WifiEvent, WifiStaDevice, WifiState,
 };
+use log::info;
+use rust_mqtt::{client::client::MqttClient, utils::rng_generator::CountingRng};
 use static_cell::make_static;
 
 extern crate alloc;
@@ -51,6 +53,7 @@ async fn main_task(spawner: Spawner) {
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
+    // PSU
     let psu_i2c =
         esp_hal::i2c::I2c::new(peripherals.I2C0, io.pins.gpio21, io.pins.gpio22, 100.kHz());
     let mut psu = axp192::Axp192::new(psu_i2c);
@@ -61,80 +64,66 @@ async fn main_task(spawner: Spawner) {
     psu.set_dcdc2_on(false).unwrap();
     psu.set_exten_on(false).unwrap();
 
-    //   let wifi_init = esp_wifi::init(
-    //       EspWifiInitFor::Wifi,
-    //       timg0.timer1,
-    //       Rng::new(peripherals.RNG),
-    //       peripherals.RADIO_CLK,
-    //   )
-    //   .expect("Failed to initialize WiFi clocks");
-    //   let mut socket_storage: [SocketStorage; 3] = Default::default();
-    //   let (_wifi_interface, wifi_device, wifi_controller, _wifi_sockets) = create_network_interface(
-    //       &wifi_init,
-    //       peripherals.WIFI,
-    //       WifiStaDevice,
-    //       &mut socket_storage,
-    //   )
-    //   .expect("Failed to create WiFi network interface");
+    // WIFI
+    let mut rng = Rng::new(peripherals.RNG);
+    let wifi_init = esp_wifi::init(
+        esp_wifi::EspWifiInitFor::Wifi,
+        timg0.timer1,
+        rng,
+        peripherals.RADIO_CLK,
+    )
+    .expect("Failed to initialize WiFi clocks");
+    let mut socket_storage: [smoltcp::iface::SocketStorage; 3] = Default::default();
+    let (_wifi_interface, wifi_device, wifi_controller, _wifi_sockets) = create_network_interface(
+        &wifi_init,
+        peripherals.WIFI,
+        WifiStaDevice,
+        &mut socket_storage,
+    )
+    .expect("Failed to create WiFi network interface");
 
-    //   let stack_resources: &mut StackResources<3> = Box::leak(Box::new(StackResources::new()));
-    //   let stack = make_static!(embassy_net::Stack::new(
-    //       wifi_device,
-    //       embassy_net::Config::dhcpv4(Default::default()),
-    //       stack_resources,
-    //       1234u64,
-    //   ));
+    let stack_resources: &mut StackResources<3> = Box::leak(Box::new(StackResources::new()));
+    let wifi_stack = make_static!(embassy_net::Stack::new(
+        wifi_device,
+        embassy_net::Config::dhcpv4(Default::default()),
+        stack_resources,
+        1234u64,
+    ));
 
-    //   spawner
-    //       .spawn(wifi_connection(wifi_controller))
-    //       .expect("Failed to spawn WiFi connection task");
-    //   spawner
-    //       .spawn(wifi_net_task(stack))
-    //       .expect("Failed to spawn WiFi task");
+    spawner
+        .spawn(wifi_connection(wifi_controller))
+        .expect("Failed to spawn WiFi connection task");
+    spawner
+        .spawn(wifi_net_task(wifi_stack))
+        .expect("Failed to spawn WiFi task");
 
-    //log::info!("Waiting for WiFi link...");
-    //loop {
-    //    if stack.is_link_up() {
-    //        log::info!("WiFi link up");
-    //        break;
-    //    }
-    //    Timer::after(Duration::from_millis(500)).await;
-    //}
+    // GPS
+    let gps_uart = esp_hal::uart::Uart::new_async_with_config(
+        peripherals.UART1,
+        uart::config::Config {
+            baudrate: GPS_BAUD,
+            data_bits: uart::config::DataBits::DataBits8,
+            parity: uart::config::Parity::ParityNone,
+            stop_bits: uart::config::StopBits::STOP1,
+            rx_timeout: Some(50),
+            ..Default::default()
+        },
+        io.pins.gpio13,
+        io.pins.gpio15,
+    )
+    .expect("Failed to initialize GPS UART");
 
-    //log::info!("Waiting for IP...");
-    //loop {
-    //    if let Some(config) = stack.config_v4() {
-    //        log::info!("Got IP: {}", config.address);
-    //        break;
-    //    };
-    //    Timer::after(Duration::from_millis(500)).await;
-    //}
+    let gps = {
+        let gps = gps::Gps::new(gps_uart)
+            .await
+            .expect("Failed to initialize GPS");
+        make_static!(gps)
+    };
+    spawner
+        .spawn(gps_task(gps))
+        .expect("Failed to spawn GPS task");
 
-    //        let gps_uart = esp_hal::uart::Uart::new_async_with_config(
-    //            peripherals.UART1,
-    //            uart::config::Config {
-    //                baudrate: GPS_BAUD,
-    //                data_bits: uart::config::DataBits::DataBits8,
-    //                parity: uart::config::Parity::ParityNone,
-    //                stop_bits: uart::config::StopBits::STOP1,
-    //                rx_timeout: Some(50),
-    //                ..Default::default()
-    //            },
-    //            io.pins.gpio13,
-    //            io.pins.gpio15,
-    //        )
-    //        .expect("Failed to initialize GPS UART");
-
-    //        let gps = {
-    //            let gps = gps::Gps::new(gps_uart)
-    //                .await
-    //                .expect("Failed to initialize GPS");
-    //            make_static!(gps)
-    //        };
-    //        spawner
-    //            .spawn(gps_task(gps))
-    //            .expect("Failed to spawn GPS task");
-
+    // MODEM
     let modem_dtr = Output::new(io.pins.gpio32, esp_hal::gpio::Level::Low);
     let modem_ri = Input::new(io.pins.gpio33, esp_hal::gpio::Pull::None);
 
@@ -163,42 +152,6 @@ async fn main_task(spawner: Spawner) {
         let boxed = Box::new(chan);
         Box::leak(boxed)
     };
-    let on_modem_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
-        let Some(address) = ipv4_status.address else {
-            return;
-        };
-        let Some(gateway) = ipv4_status.peer_address else {
-            return;
-        };
-        let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> = ipv4_status
-            .dns_servers
-            .iter()
-            .flatten()
-            .map(|addr| embassy_net::Ipv4Address::from_bytes(&addr.0))
-            .collect();
-
-        //let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> =
-        //    heapless::Vec::from_iter(vec![
-        //        embassy_net::Ipv4Address::new(1, 1, 1, 1),
-        //        embassy_net::Ipv4Address::new(1, 0, 0, 1),
-        //    ]);
-
-        let config = StaticConfigV4 {
-            address: embassy_net::Ipv4Cidr::new(
-                embassy_net::Ipv4Address::from_bytes(&address.0),
-                0, // no network, since we are point-to-point
-            ),
-            gateway: Some(embassy_net::Ipv4Address::from_bytes(&gateway.0)),
-            dns_servers,
-        };
-
-        config_chan
-            .sender()
-            .try_send(config)
-            .map_err(|e| anyhow!("Failed to send modem ipv4 config: {:?}", e))
-            .ok();
-    };
-
     let (modem, modem_ppp) = {
         let modem = modem::Modem::new(
             &spawner,
@@ -207,7 +160,7 @@ async fn main_task(spawner: Spawner) {
             modem_ri,
             modem_pwrkey,
             modem_power_on,
-            on_modem_ipv4_up,
+            config_chan.sender(),
         )
         .await
         .expect("Failed to initialize modem");
@@ -222,37 +175,107 @@ async fn main_task(spawner: Spawner) {
         let boxed = Box::new(resources);
         Box::leak(boxed)
     };
-    let seed = 1234u64; // FIXME
+    let seed = {
+        let mut buf = [0u8; 8];
+        rng.read(&mut buf);
+        u64::from_le_bytes(buf)
+    };
 
     let dummy_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 1, 2), 24),
-        gateway: Some(embassy_net::Ipv4Address::new(192, 168, 1, 1)),
+        address: embassy_net::Ipv4Cidr::new(Ipv4Address::new(0, 0, 0, 0), 0),
+        gateway: Some(Ipv4Address::new(0, 0, 0, 0)),
         dns_servers: heapless::Vec::new(),
     });
-    let stack = {
+    let modem_stack = {
         let stack = embassy_net::Stack::new(modem_ppp, dummy_config, stack_resources, seed);
         let boxed = Box::new(stack);
         Box::leak(boxed)
     };
 
     spawner
-        .spawn(modem_net(stack))
+        .spawn(modem_net(modem_stack))
         .expect("Failed to spawn modem network task");
     spawner
-        .spawn(modem_stack_config_setter(stack, config_chan.receiver()))
+        .spawn(modem_stack_config_setter(
+            modem_stack,
+            config_chan.receiver(),
+        ))
         .expect("Failed to spawn modem stack config setter");
 
+    // MQTT
+    let mut mqtt_rx = [0u8; 128];
+    let mut mqtt_tx = [0u8; 128];
+    let mut mqtt_sock = TcpSocket::new(wifi_stack, &mut mqtt_rx, &mut mqtt_tx);
+    mqtt_sock.set_timeout(Some(Duration::from_secs(10)));
+    let endpoint = (Ipv4Address::new(10, 20, 0, 1), 1883);
     loop {
         Timer::after(Duration::from_secs(5)).await;
-        let dns = stack.dns_query("google.com", smoltcp::wire::DnsQueryType::A).await;
-        log::info!("DNS query result: {:?}", dns);
-        //info!("gps coords: {:?}", gps.get_coords().await);
+        if let Err(e) = mqtt_sock.connect(endpoint).await {
+            log::error!("Failed to connect to MQTT broker: {:?}", e);
+            continue;
+        }
+        info!("MQTT socket connected");
+
+        let mut config = rust_mqtt::client::client_config::ClientConfig::new(
+            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
+            CountingRng(20000),
+        );
+        config.add_client_id("voyagesp");
+        const MQTT_BUF_SIZE: usize = 128;
+        config.max_packet_size = (MQTT_BUF_SIZE as u32) - 1;
+        let mut client_tx = [0u8; MQTT_BUF_SIZE];
+        let mut client_rx = [0u8; MQTT_BUF_SIZE];
+        let mut client = MqttClient::<_, 5, _>::new(
+            &mut mqtt_sock,
+            &mut client_tx,
+            MQTT_BUF_SIZE,
+            &mut client_rx,
+            MQTT_BUF_SIZE,
+            config,
+        );
+
+        if let Err(e) = client.connect_to_broker().await {
+            log::error!("Failed to connect to MQTT broker: {:?}", e);
+            continue;
+        }
+
+        loop {
+            let gps_data = {
+                let raw = match gps.get_coords().await {
+                    Some(data) => data,
+                    None => {
+                        Timer::after(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                match serde_json::to_string(&raw) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        log::error!("Failed to serialize GPS data: {:?}", e);
+                        continue;
+                    }
+                }
+            };
+            let result = client
+                .send_message(
+                    "voyagesp",
+                    gps_data.as_bytes(),
+                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS0,
+                    false,
+                )
+                .await;
+            if let Err(e) = result {
+                log::error!("Failed to send message: {:?}", e);
+                break;
+            }
+            Timer::after(Duration::from_secs(2)).await;
+        }
     }
 }
 
 #[task]
 async fn modem_stack_config_setter(
-    stack: &'static embassy_net::Stack<&mut embassy_net_ppp::Device<'static>>,
+    stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
     config_chan: embassy_sync::channel::Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -268,7 +291,9 @@ async fn modem_stack_config_setter(
 }
 
 #[task]
-async fn modem_net(stack: &'static embassy_net::Stack<&mut embassy_net_ppp::Device<'static>>) {
+async fn modem_net(
+    stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
+) {
     stack.run().await;
 }
 
