@@ -1,23 +1,24 @@
-use core::str::FromStr;
-
 use alloc::sync::Arc;
 use anyhow::anyhow;
-use atat::{asynch::AtatClient, AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel};
+use core::str::FromStr;
 use embassy_executor::task;
+use embassy_net_ppp::Ipv4Status;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::{Duration, Timer, WithTimeout};
+use embassy_time::WithTimeout as _;
+use embassy_time::{Duration, Timer};
 use esp_hal::{
     gpio::{AnyPin, Input, Output},
     peripherals::UART2,
-    uart::{Uart, UartRx, UartTx},
+    uart::Uart,
     Async,
 };
 use log::info;
-use static_cell::StaticCell;
+use static_cell::{make_static, StaticCell};
 
-use crate::modem::common::general::urc::PinStatus;
+use voyagesp as lib;
 
-mod common;
+use lib::at::{general::urc::PinStatus, Urc};
+
 mod interface;
 
 use interface::ModemInterface;
@@ -31,6 +32,7 @@ enum ModemState {
     SimReady,
     SimOnline,
     GprsOnline,
+    PPPInitialized,
 }
 
 pub struct Modem {
@@ -46,13 +48,26 @@ impl Modem {
         ri: Input<'static, AnyPin>,
         pwrkey: Output<'static, AnyPin>,
         power_on: Output<'static, AnyPin>,
-    ) -> anyhow::Result<Self> {
-        let interface = ModemInterface::new(spawner, dtr, ri, pwrkey, power_on, uart).await?;
+        on_ipv4_up: impl FnMut(Ipv4Status) + 'static + Copy,
+    ) -> anyhow::Result<(Self, embassy_net_ppp::Device<'static>)> {
+        let (interface, data_tx, data_rx) =
+            ModemInterface::new(spawner, dtr, ri, pwrkey, power_on, uart).await?;
+        let state: Arc<Mutex<CriticalSectionRawMutex, ModemState>> = Default::default();
 
-        Ok(Self {
-            interface: Arc::new(Mutex::new(interface)),
-            state: Default::default(),
-        })
+        let ppp_state = make_static!(embassy_net_ppp::State::new());
+        let (ppp_device, ppp_runner) = embassy_net_ppp::new::<16, 16>(ppp_state);
+
+        spawner
+            .spawn(ppp_task(data_tx, data_rx, ppp_runner, on_ipv4_up))
+            .map_err(|e| anyhow!("Failed to spawn PPP task: {:?}", e))?;
+
+        Ok((
+            Self {
+                interface: Arc::new(Mutex::new(interface)),
+                state,
+            },
+            ppp_device,
+        ))
     }
 
     /// Modem stack task
@@ -112,9 +127,9 @@ impl Modem {
         }
     }
 
-    async fn handle_urc(&self, int: &mut ModemInterface, urc: common::Urc) -> anyhow::Result<()> {
+    async fn handle_urc(&self, _int: &mut ModemInterface, urc: Urc) -> anyhow::Result<()> {
         match urc {
-            common::Urc::IndicatorEvent(e) => {
+            Urc::IndicatorEvent(e) => {
                 log::info!("Indicator event: {:?}", e);
                 let mut state = self.state.lock().await;
                 if let ModemState::SimReady = *state {
@@ -123,7 +138,7 @@ impl Modem {
                     }
                 }
             }
-            common::Urc::PinStatus(PinStatus { status }) => {
+            Urc::PinStatus(PinStatus { status }) => {
                 log::info!("PIN status: {}", status);
                 match status.as_str() {
                     "READY" => {
@@ -151,7 +166,7 @@ impl Modem {
     ) -> anyhow::Result<ModemState> {
         match current_state {
             ModemState::SimOnline => {
-                int.command(&common::cip::SetPDPContext {
+                int.command(&lib::at::cip::SetPDPContext {
                     cid: 1,
                     pdp_type: heapless::String::from_str("IP").unwrap(),
                     apn: heapless::String::from_str(env!("APN"))
@@ -160,11 +175,11 @@ impl Modem {
                 .await
                 .map_err(|e| anyhow!("Failed to set PDP context: {:?}", e))?;
 
-                int.command(&common::cip::AttachToGprsService { attach: 1 })
+                int.command(&lib::at::cip::AttachToGprsService { attach: 1 })
                     .await
                     .map_err(|e| anyhow!("Failed to attach to GPRS service: {:?}", e))?;
 
-                int.command(&common::cip::StartDataConnection {
+                int.command(&lib::at::cip::StartDataConnection {
                     cid: 1,
                     l2p: heapless::String::from_str("PPP").unwrap(),
                 })
@@ -173,19 +188,23 @@ impl Modem {
 
                 Ok(ModemState::GprsOnline)
             }
+            ModemState::GprsOnline => {
+                // initialize PPP
+                Ok(ModemState::PPPInitialized)
+            }
             _ => Ok(current_state),
         }
     }
 
     async fn dump_info(&self, int: &mut ModemInterface) -> anyhow::Result<()> {
         let manufacturer = int
-            .command(&common::general::GetManufacturerInfo)
+            .command(&lib::at::general::GetManufacturerInfo)
             .await
             .map_err(|e| anyhow!("Failed to get manufacturer info: {e:?}"))?;
         log::info!("Modem Manufacturer: {}", manufacturer.id);
 
         let model = int
-            .command(&common::general::GetModelInfo)
+            .command(&lib::at::general::GetModelInfo)
             .await
             .map_err(|e| anyhow!("Failed to get model info: {e:?}"))?;
         log::info!("Modem model: {}", model.id);
@@ -194,11 +213,60 @@ impl Modem {
     }
 
     async fn dump_status(&self, int: &mut ModemInterface) -> anyhow::Result<()> {
-        match int.command(&common::general::GetSignalQuality).await {
+        match int.command(&lib::at::general::GetSignalQuality).await {
             Ok(report) => log::info!("Signal quality: {:?}", report),
             Err(e) => log::error!("Failed to get signal quality: {e:?}"),
         }
 
         Ok(())
+    }
+}
+
+#[task]
+async fn ppp_task(
+    data_tx: interface::DataTx,
+    mut data_rx: interface::DataRx,
+    mut runner: embassy_net_ppp::Runner<'static>,
+    on_ipv4_up: impl FnMut(Ipv4Status) + 'static + Copy,
+) {
+    loop {
+        let rw = UnifiedDataRxTx::new(&mut data_rx, &data_tx);
+        let config = embassy_net_ppp::Config {
+            username: b"",
+            password: b"",
+        };
+        runner
+            .run(rw, config, on_ipv4_up)
+            .await
+            .map_err(|e| log::error!("PPP task failed: {:?}", e))
+            .ok();
+        embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
+    }
+}
+
+struct UnifiedDataRxTx<'a> {
+    rx: &'a mut interface::DataRx,
+    tx: &'a interface::DataTx,
+}
+impl<'a> UnifiedDataRxTx<'a> {
+    pub fn new(rx: &'a mut interface::DataRx, tx: &'a interface::DataTx) -> Self {
+        Self { rx, tx }
+    }
+}
+impl<'a> embedded_io_async::ErrorType for UnifiedDataRxTx<'a> {
+    type Error = embedded_io_async::ErrorKind;
+}
+impl<'a> embedded_io_async::BufRead for UnifiedDataRxTx<'a> {
+    async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+        Ok(self.rx.fill_buf().await)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.rx.consume(amt)
+    }
+}
+impl<'a> embedded_io_async::Write for UnifiedDataRxTx<'a> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        Ok(self.tx.write(buf).await)
     }
 }

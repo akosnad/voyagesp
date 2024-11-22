@@ -1,5 +1,5 @@
 use alloc::string::String;
-use atat::{atat_derive::AtatResp, AtatResp};
+use atat::atat_derive::AtatResp;
 
 #[derive(Clone, Debug, AtatResp)]
 pub struct NewMessageIndication {

@@ -3,33 +3,24 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, vec};
+use anyhow::anyhow;
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
-use embassy_net::StackResources;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
+use embassy_net::{ConfigV4, StackResources, StaticConfigV4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
-use embedded_io_async::{Read as _, Write as _};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Input, Io, Output},
-    peripherals::{UART0, UART2},
     prelude::*,
-    reset::software_reset,
-    rng::Rng,
-    uart::{self, UartRx, UartTx},
-    Async,
+    uart,
 };
 use esp_hal_embassy::main;
-use esp_wifi::{
-    wifi::{
-        utils::create_network_interface, ClientConfiguration, Configuration, WifiController,
-        WifiDevice, WifiEvent, WifiStaDevice, WifiState,
-    },
-    EspWifiInitFor,
+use esp_wifi::wifi::{
+    ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice,
+    WifiState,
 };
-use log::info;
-use smoltcp::iface::SocketStorage;
 use static_cell::make_static;
 
 extern crate alloc;
@@ -42,7 +33,7 @@ use gps::Gps;
 #[export_name = "custom_halt"]
 pub fn custom_halt() -> ! {
     loop {
-        //software_reset();
+        esp_hal::reset::software_reset();
     }
 }
 
@@ -144,8 +135,6 @@ async fn main_task(spawner: Spawner) {
     //            .spawn(gps_task(gps))
     //            .expect("Failed to spawn GPS task");
 
-    // let status_chan = channel::Channel::<NoopRawMutex, StatusEvent, 3>::new();
-
     let modem_dtr = Output::new(io.pins.gpio32, esp_hal::gpio::Level::Low);
     let modem_ri = Input::new(io.pins.gpio33, esp_hal::gpio::Pull::None);
 
@@ -168,40 +157,49 @@ async fn main_task(spawner: Spawner) {
     )
     .expect("Failed to initialize modem UART");
 
-    //let mut modem_interface = modem::ModemInterface {
-    //    uart: modem_uart,
-    //    dtr: modem_dtr,
-    //    ri: modem_ri,
-    //    pwrkey: modem_pwrkey,
-    //    power_on: modem_power_on,
-    //};
-    //modem::modem_init(&mut modem_interface).await.expect("Failed to initialize modem");
+    let config_chan = {
+        let chan: embassy_sync::channel::Channel<CriticalSectionRawMutex, StaticConfigV4, 1> =
+            embassy_sync::channel::Channel::new();
+        let boxed = Box::new(chan);
+        Box::leak(boxed)
+    };
+    let on_modem_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
+        let Some(address) = ipv4_status.address else {
+            return;
+        };
+        let Some(gateway) = ipv4_status.peer_address else {
+            return;
+        };
+        let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> = ipv4_status
+            .dns_servers
+            .iter()
+            .flatten()
+            .map(|addr| embassy_net::Ipv4Address::from_bytes(&addr.0))
+            .collect();
 
-    //let mut usb_uart = esp_hal::uart::Uart::new_async_with_config(
-    //    peripherals.UART0,
-    //    uart::config::Config {
-    //        baudrate: 115_200,
-    //        data_bits: uart::config::DataBits::DataBits8,
-    //        parity: uart::config::Parity::ParityNone,
-    //        stop_bits: uart::config::StopBits::STOP1,
-    //        rx_timeout: Some(50),
-    //        ..Default::default()
-    //    },
-    //    io.pins.gpio3,
-    //    io.pins.gpio1,
-    //).expect("Failed to initialize USB UART");
+        //let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> =
+        //    heapless::Vec::from_iter(vec![
+        //        embassy_net::Ipv4Address::new(1, 1, 1, 1),
+        //        embassy_net::Ipv4Address::new(1, 0, 0, 1),
+        //    ]);
 
-    //usb_uart.write_all(b"Hello, world!\r\n").await.expect("Failed to write to USB UART");
+        let config = StaticConfigV4 {
+            address: embassy_net::Ipv4Cidr::new(
+                embassy_net::Ipv4Address::from_bytes(&address.0),
+                0, // no network, since we are point-to-point
+            ),
+            gateway: Some(embassy_net::Ipv4Address::from_bytes(&gateway.0)),
+            dns_servers,
+        };
 
-    //let (usb_rx, usb_tx) = usb_uart.split();
-    //let (modem_rx, modem_tx) = modem_interface.uart.split();
+        config_chan
+            .sender()
+            .try_send(config)
+            .map_err(|e| anyhow!("Failed to send modem ipv4 config: {:?}", e))
+            .ok();
+    };
 
-    //let usb_tx: UsbTx = Arc::new(Mutex::new(usb_tx));
-
-    //spawner.spawn(usb_reader(usb_rx, modem_tx, usb_tx.clone())).expect("Failed to spawn USB reader task");
-    //spawner.spawn(modem_reader(modem_rx, usb_tx)).expect("Failed to spawn modem reader task");
-
-    let modem = {
+    let (modem, modem_ppp) = {
         let modem = modem::Modem::new(
             &spawner,
             modem_uart,
@@ -209,6 +207,7 @@ async fn main_task(spawner: Spawner) {
             modem_ri,
             modem_pwrkey,
             modem_power_on,
+            on_modem_ipv4_up,
         )
         .await
         .expect("Failed to initialize modem");
@@ -218,58 +217,59 @@ async fn main_task(spawner: Spawner) {
         .spawn(modem_task(modem))
         .expect("Failed to spawn modem task");
 
+    let stack_resources = {
+        let resources: StackResources<3> = StackResources::new();
+        let boxed = Box::new(resources);
+        Box::leak(boxed)
+    };
+    let seed = 1234u64; // FIXME
+
+    let dummy_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 1, 2), 24),
+        gateway: Some(embassy_net::Ipv4Address::new(192, 168, 1, 1)),
+        dns_servers: heapless::Vec::new(),
+    });
+    let stack = {
+        let stack = embassy_net::Stack::new(modem_ppp, dummy_config, stack_resources, seed);
+        let boxed = Box::new(stack);
+        Box::leak(boxed)
+    };
+
+    spawner
+        .spawn(modem_net(stack))
+        .expect("Failed to spawn modem network task");
+    spawner
+        .spawn(modem_stack_config_setter(stack, config_chan.receiver()))
+        .expect("Failed to spawn modem stack config setter");
+
     loop {
         Timer::after(Duration::from_secs(5)).await;
-
+        let dns = stack.dns_query("google.com", smoltcp::wire::DnsQueryType::A).await;
+        log::info!("DNS query result: {:?}", dns);
         //info!("gps coords: {:?}", gps.get_coords().await);
     }
 }
 
-type UsbTx = Arc<Mutex<CriticalSectionRawMutex, UartTx<'static, UART0, Async>>>;
-
 #[task]
-async fn usb_reader(
-    mut usb_rx: UartRx<'static, UART0, Async>,
-    mut modem_tx: UartTx<'static, UART2, Async>,
-    usb_tx: UsbTx,
-) -> ! {
+async fn modem_stack_config_setter(
+    stack: &'static embassy_net::Stack<&mut embassy_net_ppp::Device<'static>>,
+    config_chan: embassy_sync::channel::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        StaticConfigV4,
+        1,
+    >,
+) {
     loop {
-        let mut buf = [0u8; 512];
-        let len = usb_rx
-            .read(&mut buf)
-            .await
-            .expect("Failed to read from USB UART");
-        modem_tx
-            .write_all(&buf[..len])
-            .await
-            .expect("Failed to write to modem UART");
-        usb_tx
-            .lock()
-            .await
-            .write_all(&buf[..len])
-            .await
-            .expect("Failed to write to USB UART");
+        let config = config_chan.receive().await;
+        log::info!("Got modem ipv4 config: {:?}", config);
+        stack.set_config_v4(ConfigV4::Static(config));
     }
 }
 
 #[task]
-async fn modem_reader(mut modem_rx: UartRx<'static, UART2, Async>, usb_tx: UsbTx) -> ! {
-    loop {
-        let mut buf = [0u8; 1024];
-        match modem_rx.read(&mut buf).await {
-            Ok(len) => {
-                usb_tx
-                    .lock()
-                    .await
-                    .write_all(&buf[..len])
-                    .await
-                    .expect("Failed to write to USB UART");
-            }
-            Err(e) => {
-                log::error!("Modem read failed: {:?}", e);
-            }
-        }
-    }
+async fn modem_net(stack: &'static embassy_net::Stack<&mut embassy_net_ppp::Device<'static>>) {
+    stack.run().await;
 }
 
 #[task]
