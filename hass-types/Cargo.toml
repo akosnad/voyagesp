@@ -1,0 +1,9 @@
+[package]
+name = "hass-types"
+version = "0.1.0"
+authors = ["akosnad"]
+edition = "2021"
+
+[dependencies]
+heapless = { version = "0.8.0", features = ["serde"] }
+serde = { version = "1.0.215", default-features = false, features = ["derive", "alloc"] }

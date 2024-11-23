@@ -4,6 +4,7 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read as _, ReadReady as _, Write as _};
 use esp_hal::{peripherals::UART1, uart::Uart, Async};
+use hass_types::DeviceTrackerAttributes;
 use log::{info, trace};
 use ublox::{GpsFix, PacketRef};
 
@@ -24,6 +25,16 @@ impl From<ublox::NavPvtRef<'_>> for GpsCoords {
             height: nav.height_meters(),
             horiz_accuracy: nav.horiz_accuracy(),
             satellite_count: nav.num_satellites(),
+        }
+    }
+}
+
+impl From<GpsCoords> for DeviceTrackerAttributes {
+    fn from(coords: GpsCoords) -> Self {
+        Self {
+            longitude: coords.lon,
+            latitude: coords.lat,
+            gps_accuracy: Some(coords.horiz_accuracy as f64),
         }
     }
 }

@@ -1,8 +1,11 @@
+use hass_types::DeviceTracker;
+
 #[derive(serde::Deserialize)]
 struct Config {
     wifi_ssid: String,
     wifi_password: String,
     apn: String,
+    device_tracker_config: DeviceTracker,
 }
 
 impl Config {
@@ -23,4 +26,7 @@ fn main() {
         serde_yaml::from_str::<Config>(&config_string).expect("config.yml is not valid")
     };
     config.export_vars();
+
+    uneval::to_out_dir(config.device_tracker_config, "device_tracker_config.rs")
+        .expect("Failed to write device_tracker_config.rs");
 }

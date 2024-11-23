@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
-use embassy_net::{tcp::TcpSocket, ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
+use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
@@ -21,14 +21,14 @@ use esp_wifi::wifi::{
     utils::create_network_interface, ClientConfiguration, Configuration, WifiController,
     WifiDevice, WifiEvent, WifiStaDevice, WifiState,
 };
-use log::info;
-use rust_mqtt::{client::client::MqttClient, utils::rng_generator::CountingRng};
 use static_cell::make_static;
 
 extern crate alloc;
 
+mod config;
 mod gps;
 mod modem;
+mod mqtt;
 
 use gps::Gps;
 
@@ -221,73 +221,18 @@ async fn main_task(spawner: Spawner) {
         .expect("Failed to spawn modem stack config setter");
 
     // MQTT
-    let mut mqtt_rx = [0u8; 128];
-    let mut mqtt_tx = [0u8; 128];
-    let mut mqtt_sock = TcpSocket::new(wifi_stack, &mut mqtt_rx, &mut mqtt_tx);
-    mqtt_sock.set_timeout(Some(Duration::from_secs(10)));
-    let endpoint = (Ipv4Address::new(10, 20, 0, 1), 1883);
+    let mqtt = make_static!(mqtt::Mqtt::new(wifi_stack, modem_stack, rng));
+    spawner
+        .spawn(mqtt_task(mqtt))
+        .expect("Failed to spawn MQTT task");
+
     loop {
-        Timer::after(Duration::from_secs(5)).await;
-        if let Err(e) = mqtt_sock.connect(endpoint).await {
-            log::error!("Failed to connect to MQTT broker: {:?}", e);
-            continue;
-        }
-        info!("MQTT socket connected");
-
-        let mut config = rust_mqtt::client::client_config::ClientConfig::new(
-            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-            CountingRng(20000),
-        );
-        config.add_client_id("voyagesp");
-        const MQTT_BUF_SIZE: usize = 128;
-        config.max_packet_size = (MQTT_BUF_SIZE as u32) - 1;
-        let mut client_tx = [0u8; MQTT_BUF_SIZE];
-        let mut client_rx = [0u8; MQTT_BUF_SIZE];
-        let mut client = MqttClient::<_, 5, _>::new(
-            &mut mqtt_sock,
-            &mut client_tx,
-            MQTT_BUF_SIZE,
-            &mut client_rx,
-            MQTT_BUF_SIZE,
-            config,
-        );
-
-        if let Err(e) = client.connect_to_broker().await {
-            log::error!("Failed to connect to MQTT broker: {:?}", e);
-            continue;
-        }
-
-        loop {
-            let gps_data = {
-                let raw = match gps.get_coords().await {
-                    Some(data) => data,
-                    None => {
-                        Timer::after(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                };
-                match serde_json::to_string(&raw) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        log::error!("Failed to serialize GPS data: {:?}", e);
-                        continue;
-                    }
-                }
-            };
-            let result = client
-                .send_message(
-                    "voyagesp",
-                    gps_data.as_bytes(),
-                    rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS0,
-                    false,
-                )
+        if let Some(gps_data) = gps.get_coords().await {
+            log::info!("GPS data: {:?}", gps_data);
+            mqtt.send_event(mqtt::Event::DeviceTrackerStateChange(gps_data.into()))
                 .await;
-            if let Err(e) = result {
-                log::error!("Failed to send message: {:?}", e);
-                break;
-            }
-            Timer::after(Duration::from_secs(2)).await;
         }
+        Timer::after(Duration::from_secs(5)).await;
     }
 }
 
@@ -387,4 +332,9 @@ async fn gps_task(gps: &'static Gps<GPS_BAUD>) {
 #[task]
 async fn modem_task(modem: &'static modem::Modem) {
     modem.run().await;
+}
+
+#[task]
+async fn mqtt_task(mqtt: &'static mqtt::Mqtt) {
+    mqtt.run().await;
 }
