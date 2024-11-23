@@ -23,7 +23,7 @@ mod interface;
 
 use interface::ModemInterface;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 enum ModemState {
     #[default]
     Uninitialized,
@@ -32,7 +32,7 @@ enum ModemState {
     SimReady,
     SimOnline,
     GprsOnline,
-    PPPInitialized,
+    PPPFailed,
 }
 
 pub struct Modem {
@@ -63,7 +63,13 @@ impl Modem {
         let (ppp_device, ppp_runner) = embassy_net_ppp::new::<16, 16>(ppp_state);
 
         spawner
-            .spawn(ppp_task(data_tx, data_rx, ppp_runner, config_sender))
+            .spawn(ppp_task(
+                data_tx,
+                data_rx,
+                ppp_runner,
+                config_sender,
+                state.clone(),
+            ))
             .map_err(|e| anyhow!("Failed to spawn PPP task: {:?}", e))?;
 
         Ok((
@@ -170,6 +176,18 @@ impl Modem {
         current_state: ModemState,
     ) -> anyhow::Result<ModemState> {
         match current_state {
+            ModemState::SimReady => {
+                let sig = int
+                    .command(&lib::at::general::GetSignalQuality)
+                    .await
+                    .map_err(|e| anyhow!("Failed to get signal quality: {e:?}"))?;
+                if sig.rssi > 0 && sig.ber > 0 {
+                    log::info!("Modem signal acquired");
+                    Ok(ModemState::SimOnline)
+                } else {
+                    Ok(current_state)
+                }
+            }
             ModemState::SimOnline => {
                 int.command(&lib::at::cip::SetPDPContext {
                     cid: 1,
@@ -193,9 +211,18 @@ impl Modem {
 
                 Ok(ModemState::GprsOnline)
             }
-            ModemState::GprsOnline => {
-                // initialize PPP
-                Ok(ModemState::PPPInitialized)
+            ModemState::PPPFailed => {
+                int.command_mode().await?;
+
+                let sig = int
+                    .command(&lib::at::general::GetSignalQuality)
+                    .await
+                    .map_err(|e| anyhow!("Failed to get signal quality: {e:?}"))?;
+                if sig.rssi == 0 && sig.ber == 0 {
+                    log::warn!("Modem signal lost");
+                    return Ok(ModemState::SimReady);
+                }
+                Ok(ModemState::SimOnline)
             }
             _ => Ok(current_state),
         }
@@ -238,26 +265,29 @@ async fn ppp_task(
         StaticConfigV4,
         1,
     >,
+    modem_state: Arc<Mutex<CriticalSectionRawMutex, ModemState>>,
 ) {
     let on_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
         let Some(address) = ipv4_status.address else {
+            log::warn!("No address set in ipv4 modem PPP status");
             return;
         };
         let Some(gateway) = ipv4_status.peer_address else {
+            log::warn!("No gateway set in ipv4 modem PPP status");
             return;
         };
-        let dns_servers: heapless::Vec<Ipv4Address, 3> = ipv4_status
-            .dns_servers
-            .iter()
-            .flatten()
-            .map(|addr| Ipv4Address::from_bytes(&addr.0))
-            .collect();
-
-        //let dns_servers: heapless::Vec<embassy_net::Ipv4Address, 3> =
-        //    heapless::Vec::from_iter(vec![
-        //        embassy_net::Ipv4Address::new(1, 1, 1, 1),
-        //        embassy_net::Ipv4Address::new(1, 0, 0, 1),
-        //    ]);
+        let dns_servers: heapless::Vec<Ipv4Address, 3> = if ipv4_status.dns_servers.is_empty() {
+            // fallback to cloudflare dns if none specified from ppp
+            heapless::Vec::from_slice(&[Ipv4Address::new(1, 1, 1, 1), Ipv4Address::new(1, 0, 0, 1)])
+                .unwrap()
+        } else {
+            ipv4_status
+                .dns_servers
+                .iter()
+                .flatten()
+                .map(|addr| Ipv4Address::from_bytes(&addr.0))
+                .collect()
+        };
 
         let config = StaticConfigV4 {
             address: embassy_net::Ipv4Cidr::new(
@@ -280,15 +310,18 @@ async fn ppp_task(
             username: b"",
             password: b"",
         };
-        runner
-            .run(rw, config, on_ipv4_up)
-            .await
-            .map_err(|e| log::error!("PPP task failed: {:?}", e))
-            .ok();
+        if let Err(e) = runner.run(rw, config, on_ipv4_up).await {
+            log::error!("PPP link exited with error: {:?}", e);
+            let mut state = modem_state.lock().await;
+            if *state == ModemState::GprsOnline {
+                *state = ModemState::PPPFailed;
+            }
+        }
         embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
     }
 }
 
+/// Wrapper around DataRx and DataTx to implement embedded_io_async::BufRead and embedded_io_async::Write
 struct UnifiedDataRxTx<'a> {
     rx: &'a mut interface::DataRx,
     tx: &'a interface::DataTx,

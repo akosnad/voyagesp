@@ -41,6 +41,12 @@ pub fn custom_halt() -> ! {
 
 const GPS_BAUD: u32 = 9600;
 
+#[derive(Debug)]
+pub enum SystemEvent {
+    IgnitionOn,
+    IgnitionOff,
+}
+
 #[main]
 async fn main_task(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
@@ -52,6 +58,18 @@ async fn main_task(spawner: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Debug);
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
+
+    let ignition_sense = Input::new(io.pins.gpio14, esp_hal::gpio::Pull::Down);
+    let event_channel = {
+        let chan: embassy_sync::channel::Channel<CriticalSectionRawMutex, SystemEvent, 5> =
+            embassy_sync::channel::Channel::new();
+        let boxed = Box::new(chan);
+        Box::leak(boxed)
+    };
+
+    spawner
+        .spawn(ignition_sense_task(ignition_sense, event_channel.sender()))
+        .expect("Failed to spawn ignition sense task");
 
     // PSU
     let psu_i2c =
@@ -270,6 +288,25 @@ async fn main_task(spawner: Spawner) {
             }
             Timer::after(Duration::from_secs(2)).await;
         }
+    }
+}
+
+#[task]
+async fn ignition_sense_task(
+    mut sense: Input<'static>,
+    event_chan: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SystemEvent, 5>,
+) -> ! {
+    loop {
+        let level = sense.get_level();
+        log::info!("Ignition sense: {:?}", level);
+        event_chan
+            .send(match level {
+                esp_hal::gpio::Level::Low => SystemEvent::IgnitionOff,
+                esp_hal::gpio::Level::High => SystemEvent::IgnitionOn,
+            })
+            .await;
+        Timer::after(Duration::from_secs(1)).await;
+        sense.wait_for_any_edge().await;
     }
 }
 
