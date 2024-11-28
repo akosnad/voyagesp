@@ -1,3 +1,5 @@
+use core::str::FromStr;
+
 use anyhow::anyhow;
 use embassy_futures::select::{select3, Either3};
 use embassy_net::{tcp::TcpSocket, Ipv4Address};
@@ -38,6 +40,8 @@ impl Mqtt {
         let mut config =
             ClientConfig::new(rust_mqtt::client::client_config::MqttVersion::MQTTv5, rng);
         config.add_client_id(&system_config.device_tracker.unique_id.0);
+        config.add_username(env!("MQTT_USER"));
+        config.add_password(env!("MQTT_PASSWORD"));
         if let Some(availability) = system_config.device_tracker.availability.first() {
             let payload_offline = availability
                 .payload_not_available
@@ -45,7 +49,7 @@ impl Mqtt {
                 .unwrap_or("offline");
             config.add_will(&availability.topic, payload_offline.as_bytes(), true);
         }
-        config.keep_alive = 60;
+        config.keep_alive = 15;
         config.max_packet_size = (BUF_SIZE as u32) - 1;
 
         Self {
@@ -60,7 +64,11 @@ impl Mqtt {
     ///
     /// Should be only called once
     pub async fn run(&self) -> ! {
-        let endpoint = (Ipv4Address::new(10, 20, 0, 1), 1883);
+        let endpoint = (
+            Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
+                .expect("invalid IP address for MQTT WiFi endpoint"),
+            u16::from_str(env!("MQTT_PORT")).expect("invalid MQTT port"),
+        );
         'socket_retry: loop {
             Timer::after(Duration::from_secs(5)).await;
 

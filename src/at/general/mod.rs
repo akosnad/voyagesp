@@ -40,7 +40,7 @@ impl AtatCmd for DTRControl {
         use embedded_io::Write;
         let buf_len = buf.len();
         assert!(buf_len >= Self::MAX_LEN);
-        write!(buf, "AT&D{}\r\n", self.dtr);
+        write!(buf, "AT&D{}\r\n", self.dtr).ok();
         buf_len - buf.len()
     }
 
