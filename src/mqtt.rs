@@ -16,7 +16,7 @@ use rust_mqtt::{
 };
 use serde::Serialize;
 
-use crate::PsuData;
+use crate::{gps::GpsCoords, PsuData};
 
 const BUF_SIZE: usize = 2048;
 const MAX_PROPERTIES: usize = 10;
@@ -28,7 +28,7 @@ type ModemStack = &'static embassy_net::Stack<&'static mut embassy_net_ppp::Devi
 
 #[derive(Debug)]
 pub enum Event {
-    DeviceTracker(DeviceTrackerAttributes),
+    DeviceTracker(GpsCoords),
     Ignition(bool),
     Psu(PsuData),
 }
@@ -49,6 +49,7 @@ struct DiagnosticEntities {
     ext_voltage: Sensor,
     ext_current: Sensor,
     int_temperature: Sensor,
+    satellite_count: Sensor,
 }
 impl DiagnosticEntities {
     pub fn get() -> &'static Self {
@@ -58,83 +59,97 @@ impl DiagnosticEntities {
             let availability = config.device_tracker.availability.to_owned();
             let device = config.device_tracker.device.clone();
 
-            macro_rules! sensor {
-                ($name:ident, $display_name:literal, $device_class:expr, $state_class:expr, $unit:literal) => {
-                    Sensor {
-                        availability: availability.clone(),
-                        device: device.clone(),
-                        unique_id: hass_types::UniqueId(
-                            format!("{}_{}", TOPIC_PREFIX, stringify!($name)).into(),
-                        ),
-                        name: ($display_name).into(),
-                        device_class: Some($device_class),
-                        state_class: Some($state_class),
-                        state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, stringify!($name))),
-                        entity_category: Some(hass_types::EntityCategory::diagnostic),
-                        suggested_display_precision: Some(2),
-                        unit_of_measurement: Some(($unit).into()),
-                        ..Default::default()
-                    }
-                };
-            }
+            let gen_sensor = |name: &'static str,
+                              display_name: &'static str,
+                              device_class: Option<hass_types::SensorDeviceClass>,
+                              state_class: Option<hass_types::SensorStateClass>,
+                              precision: Option<u8>,
+                              unit_of_measurement: Option<&'static str>|
+             -> Sensor {
+                Sensor {
+                    availability: availability.clone(),
+                    device: device.clone(),
+                    unique_id: hass_types::UniqueId(format!("{}_{}", TOPIC_PREFIX, name)),
+                    name: display_name.into(),
+                    device_class,
+                    state_class,
+                    state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, name)),
+                    entity_category: Some(hass_types::EntityCategory::diagnostic),
+                    suggested_display_precision: precision,
+                    unit_of_measurement: unit_of_measurement.map(Into::into),
+                    ..Default::default()
+                }
+            };
 
-            macro_rules! binary_sensor {
-                ($name:ident, $display_name:literal, $device_class:expr) => {
-                    BinarySensor {
-                        availability: availability.clone(),
-                        device: device.clone(),
-                        unique_id: hass_types::UniqueId(
-                            format!("{}_{}", TOPIC_PREFIX, stringify!($name)).into(),
-                        ),
-                        name: ($display_name).into(),
-                        device_class: Some($device_class),
-                        state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, stringify!($name))),
-                        entity_category: Some(hass_types::EntityCategory::diagnostic),
-                        ..Default::default()
-                    }
-                };
-            }
+            let gen_binary_sensor = |name: &'static str,
+                                     display_name: &'static str,
+                                     device_class: Option<hass_types::BinarySensorDeviceClass>|
+             -> BinarySensor {
+                BinarySensor {
+                    availability: availability.clone(),
+                    device: device.clone(),
+                    unique_id: hass_types::UniqueId(format!("{}_{}", TOPIC_PREFIX, name)),
+                    name: display_name.into(),
+                    device_class,
+                    state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, name)),
+                    entity_category: Some(hass_types::EntityCategory::diagnostic),
+                    ..Default::default()
+                }
+            };
 
             Self {
-                battery_charging: binary_sensor!(
-                    battery_charging,
+                battery_charging: gen_binary_sensor(
+                    "battery_charging",
                     "Battery Charging",
-                    hass_types::BinarySensorDeviceClass::battery_charging
+                    Some(hass_types::BinarySensorDeviceClass::battery_charging),
                 ),
-                battery_voltage: sensor!(
-                    battery_voltage,
+                battery_voltage: gen_sensor(
+                    "battery_voltage",
                     "Battery Voltage",
-                    hass_types::SensorDeviceClass::voltage,
-                    hass_types::SensorStateClass::Measurement,
-                    "V"
+                    Some(hass_types::SensorDeviceClass::voltage),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(3),
+                    Some("V"),
                 ),
-                battery_charge_current: sensor!(
-                    battery_charge_current,
+                battery_charge_current: gen_sensor(
+                    "battery_charge_current",
                     "Battery Charge Current",
-                    hass_types::SensorDeviceClass::current,
-                    hass_types::SensorStateClass::Measurement,
-                    "A"
+                    Some(hass_types::SensorDeviceClass::current),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(4),
+                    Some("A"),
                 ),
-                ext_voltage: sensor!(
-                    ext_voltage,
+                ext_voltage: gen_sensor(
+                    "ext_voltage",
                     "External Voltage",
-                    hass_types::SensorDeviceClass::voltage,
-                    hass_types::SensorStateClass::Measurement,
-                    "V"
+                    Some(hass_types::SensorDeviceClass::voltage),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(3),
+                    Some("V"),
                 ),
-                ext_current: sensor!(
-                    ext_current,
+                ext_current: gen_sensor(
+                    "ext_current",
                     "External Current",
-                    hass_types::SensorDeviceClass::current,
-                    hass_types::SensorStateClass::Measurement,
-                    "A"
+                    Some(hass_types::SensorDeviceClass::current),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(4),
+                    Some("A"),
                 ),
-                int_temperature: sensor!(
-                    int_temperature,
+                int_temperature: gen_sensor(
+                    "int_temperature",
                     "Internal Temperature",
-                    hass_types::SensorDeviceClass::temperature,
-                    hass_types::SensorStateClass::Measurement,
-                    "°C"
+                    Some(hass_types::SensorDeviceClass::temperature),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(1),
+                    Some("°C"),
+                ),
+                satellite_count: gen_sensor(
+                    "satellite_count",
+                    "GPS Satellite Count",
+                    Some(hass_types::SensorDeviceClass::signal_strength),
+                    Some(hass_types::SensorStateClass::Measurement),
+                    Some(0),
+                    None,
                 ),
             }
         })
@@ -343,6 +358,7 @@ impl Mqtt {
             ref ext_voltage,
             ref ext_current,
             ref int_temperature,
+            ref satellite_count,
         } = DiagnosticEntities::get();
 
         self.send_discovery_config(client, battery_charging).await?;
@@ -352,6 +368,7 @@ impl Mqtt {
         self.send_discovery_config(client, ext_voltage).await?;
         self.send_discovery_config(client, ext_current).await?;
         self.send_discovery_config(client, int_temperature).await?;
+        self.send_discovery_config(client, satellite_count).await?;
 
         Ok(())
     }
@@ -398,10 +415,18 @@ impl Mqtt {
         log::debug!("Handling event: {:?}", event);
         match event {
             Event::DeviceTracker(data) => {
+                let attrs: DeviceTrackerAttributes = data.into();
                 self.publish_entity_state(
                     client,
                     &crate::config::SystemConfig::get().device_tracker,
-                    data,
+                    attrs,
+                )
+                .await?;
+
+                self.publish_entity_state(
+                    client,
+                    &DiagnosticEntities::get().satellite_count,
+                    data.satellite_count,
                 )
                 .await?;
             }
@@ -437,30 +462,23 @@ impl Mqtt {
             ref ext_current,
             ref temperature,
         } = psu_state;
-        let DiagnosticEntities {
-            battery_charging: ref battery_charging_entity,
-            battery_voltage: ref battery_voltage_entity,
-            battery_charge_current: ref battery_charge_current_entity,
-            ext_voltage: ref ext_voltage_entity,
-            ext_current: ref ext_current_entity,
-            int_temperature: ref int_temperature_entity,
-        } = DiagnosticEntities::get();
+        let entities = DiagnosticEntities::get();
 
-        self.publish_entity_state(client, battery_charging_entity, battery_charging)
+        self.publish_entity_state(client, &entities.battery_charging, battery_charging)
             .await?;
-        self.publish_entity_state(client, battery_voltage_entity, battery_voltage)
+        self.publish_entity_state(client, &entities.battery_voltage, battery_voltage)
             .await?;
         self.publish_entity_state(
             client,
-            battery_charge_current_entity,
+            &entities.battery_charge_current,
             battery_charge_current,
         )
         .await?;
-        self.publish_entity_state(client, ext_voltage_entity, ext_voltage)
+        self.publish_entity_state(client, &entities.ext_voltage, ext_voltage)
             .await?;
-        self.publish_entity_state(client, ext_current_entity, ext_current)
+        self.publish_entity_state(client, &entities.ext_current, ext_current)
             .await?;
-        self.publish_entity_state(client, int_temperature_entity, temperature)
+        self.publish_entity_state(client, &entities.int_temperature, temperature)
             .await?;
 
         Ok(())

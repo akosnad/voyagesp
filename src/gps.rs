@@ -10,11 +10,11 @@ use ublox::{GpsFix, PacketRef};
 
 #[derive(Default, Debug, Clone, Copy, serde::Serialize)]
 pub struct GpsCoords {
-    lat: f64,
-    lon: f64,
-    height: f64,
-    horiz_accuracy: u32,
-    satellite_count: u8,
+    pub lat: f64,
+    pub lon: f64,
+    pub height: f64,
+    pub horiz_accuracy: u32,
+    pub satellite_count: u8,
 }
 
 impl From<ublox::NavPvtRef<'_>> for GpsCoords {

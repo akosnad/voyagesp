@@ -49,7 +49,9 @@ pub struct BinarySensor {
     pub json_attributes_topic: Option<Topic>,
     pub enabled_by_default: Option<bool>,
     pub off_delay: Option<u32>,
+    #[serde(default = "default_payload_on")]
     pub payload_on: Option<String>,
+    #[serde(default = "default_payload_off")]
     pub payload_off: Option<String>,
     pub entity_category: Option<EntityCategory>,
 }
@@ -66,11 +68,18 @@ impl Default for BinarySensor {
             json_attributes_topic: Default::default(),
             enabled_by_default: Default::default(),
             off_delay: Default::default(),
-            payload_on: Some("true".to_string()),
-            payload_off: Some("false".to_string()),
+            payload_on: default_payload_on(),
+            payload_off: default_payload_off(),
             entity_category: Default::default(),
         }
     }
+}
+
+fn default_payload_on() -> Option<String> {
+    Some("true".to_string())
+}
+fn default_payload_off() -> Option<String> {
+    Some("false".to_string())
 }
 
 impl Discoverable for BinarySensor {

@@ -308,8 +308,7 @@ async fn system_event_handler(event_receiver: SystemEventReceiver, mqtt: &'stati
                 mqtt.send_event(mqtt::Event::Ignition(ignition_state)).await;
             }
             SystemEvent::GpsData(gps_data) => {
-                mqtt.send_event(mqtt::Event::DeviceTracker(gps_data.into()))
-                    .await;
+                mqtt.send_event(mqtt::Event::DeviceTracker(gps_data)).await;
             }
             SystemEvent::PsuData(psu_state) => {
                 mqtt.send_event(mqtt::Event::Psu(psu_state)).await;
