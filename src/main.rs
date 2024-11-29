@@ -4,6 +4,7 @@
 #![feature(async_closure)]
 
 use alloc::boxed::Box;
+use embassy_futures::select::{select, Either};
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
 use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
@@ -14,7 +15,7 @@ use esp_hal::{
     gpio::{Input, Io, Output},
     prelude::*,
     rng::Rng,
-    uart,
+    uart, Blocking,
 };
 use esp_hal_embassy::main;
 use esp_wifi::wifi::{
@@ -74,7 +75,7 @@ async fn main_task(spawner: Spawner) {
     // PSU
     let psu_i2c =
         esp_hal::i2c::I2c::new(peripherals.I2C0, io.pins.gpio21, io.pins.gpio22, 100.kHz());
-    let mut psu = axp192::Axp192::new(psu_i2c);
+    let mut psu = make_static!(axp192::Axp192::new(psu_i2c));
 
     psu.set_dcdc1_on(false).unwrap();
     psu.set_ldo2_on(false).unwrap();
@@ -226,12 +227,38 @@ async fn main_task(spawner: Spawner) {
         .spawn(mqtt_task(mqtt))
         .expect("Failed to spawn MQTT task");
 
+    // System tasks
+    spawner.spawn(system_data_sender(mqtt, psu)).expect("Failed to spawn system data sender");
+
+    let mut ignition = false;
     loop {
-        if let Some(gps_data) = gps.get_coords().await {
-            log::info!("GPS data: {:?}", gps_data);
-            mqtt.send_event(mqtt::Event::DeviceTrackerStateChange(gps_data.into()))
-                .await;
+        let event = event_channel.receive();
+        let gps_coords = gps.get_coords();
+        match select(event, gps_coords).await {
+            Either::First(event) => match event {
+                SystemEvent::IgnitionOn => ignition = true,
+                SystemEvent::IgnitionOff => ignition = false,
+            },
+            Either::Second(Some(gps_coords)) => {
+                if ignition {
+                    mqtt.send_event(mqtt::Event::DeviceTrackerStateChange(gps_coords.into()))
+                        .await;
+                }
+                Timer::after(Duration::from_secs(5)).await;
+            }
+            Either::Second(None) => {
+                // GPS got no fix, ignore
+            }
         }
+    }
+}
+
+#[task]
+async fn system_data_sender(
+    mqtt: &'static mqtt::Mqtt,
+    psu: &'static mut axp192::Axp192<esp_hal::i2c::I2c<'static, esp_hal::peripherals::I2C0, Blocking>>,
+) -> ! {
+    loop {
         Timer::after(Duration::from_secs(5)).await;
     }
 }

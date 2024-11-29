@@ -34,7 +34,8 @@ impl From<GpsCoords> for DeviceTrackerAttributes {
         Self {
             longitude: coords.lon,
             latitude: coords.lat,
-            gps_accuracy: Some(coords.horiz_accuracy as f64),
+            // NAV-PVT reports in millimeters, convert to meters
+            gps_accuracy: Some(coords.horiz_accuracy as f64 / 1000.),
         }
     }
 }

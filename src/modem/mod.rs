@@ -123,10 +123,6 @@ impl Modem {
                     .ok();
             }
 
-            // self.dump_status(&mut int)
-            //     .await
-            //     .map_err(|e| log::error!("Failed to dump status: {:?}", e)).ok();
-
             {
                 let mut state_guard = self.state.lock().await;
                 let pending_state = state_guard.clone();
@@ -240,15 +236,6 @@ impl Modem {
             .await
             .map_err(|e| anyhow!("Failed to get model info: {e:?}"))?;
         log::info!("Modem model: {}", model.id);
-
-        Ok(())
-    }
-
-    async fn dump_status(&self, int: &mut ModemInterface) -> anyhow::Result<()> {
-        match int.command(&lib::at::general::GetSignalQuality).await {
-            Ok(report) => log::info!("Signal quality: {:?}", report),
-            Err(e) => log::error!("Failed to get signal quality: {e:?}"),
-        }
 
         Ok(())
     }

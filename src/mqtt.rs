@@ -2,7 +2,7 @@ use core::str::FromStr;
 
 use anyhow::anyhow;
 use embassy_futures::select::{select3, Either3};
-use embassy_net::{tcp::TcpSocket, Ipv4Address};
+use embassy_net::{driver::Driver, tcp::TcpSocket, Ipv4Address, Stack};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Timer};
 use esp_hal::rng::Rng;
@@ -24,6 +24,14 @@ type ModemStack = &'static embassy_net::Stack<&'static mut embassy_net_ppp::Devi
 #[derive(Debug)]
 pub enum Event {
     DeviceTrackerStateChange(DeviceTrackerAttributes),
+}
+
+type Endpoint = (Ipv4Address, u16);
+
+struct Connection<'s> {
+    socket: TcpSocket<'s>,
+    endpoint: Endpoint,
+    is_wifi: bool,
 }
 
 pub struct Mqtt {
@@ -60,24 +68,69 @@ impl Mqtt {
         }
     }
 
+    async fn setup_tcp_socket<'a>(
+        &self,
+        rx: &'a mut [u8],
+        tx: &'a mut [u8],
+    ) -> anyhow::Result<Connection<'a>> {
+        let port = u16::from_str(env!("MQTT_PORT")).expect("invalid MQTT port");
+
+        if self.wifi_stack.is_link_up() && self.wifi_stack.is_config_up() {
+            let ip = Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
+                        .expect("invalid IP address for MQTT WiFi endpoint");
+
+            log::debug!("Using MQTT endpoint: {ip}:{port}");
+
+            Ok(Connection {
+                socket: TcpSocket::new(self.wifi_stack, rx, tx),
+                endpoint: (
+                    ip,
+                    port,
+                ),
+                is_wifi: true,
+            })
+        } else if self.modem_stack.is_link_up() {
+            let Ok(ip) = get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await else {
+                anyhow::bail!("Failed to get IP address for MQTT modem endpoint");
+            };
+            log::debug!("Using MQTT endpoint: {ip}:{port}");
+
+            Ok(Connection {
+                socket: TcpSocket::new(self.modem_stack, rx, tx),
+                endpoint: (
+                    ip,
+                    port
+                ),
+                is_wifi: false,
+            })
+        } else {
+            anyhow::bail!("No network connection available");
+        }
+    }
+
     /// MQTT stack task
     ///
     /// Should be only called once
     pub async fn run(&self) -> ! {
-        let endpoint = (
-            Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
-                .expect("invalid IP address for MQTT WiFi endpoint"),
-            u16::from_str(env!("MQTT_PORT")).expect("invalid MQTT port"),
-        );
         'socket_retry: loop {
             Timer::after(Duration::from_secs(5)).await;
 
             let mut mqtt_rx = [0u8; 128];
             let mut mqtt_tx = [0u8; 128];
-            let mut mqtt_sock = TcpSocket::new(self.wifi_stack, &mut mqtt_rx, &mut mqtt_tx);
-            mqtt_sock.set_timeout(Some(Duration::from_secs(10)));
+            let Connection {
+                mut socket,
+                endpoint,
+                is_wifi: connection_is_wifi,
+            } = match self.setup_tcp_socket(&mut mqtt_rx, &mut mqtt_tx).await {
+                Ok(res) => res,
+                Err(e) => {
+                    log::error!("Failed to setup MQTT socket: {:?}", e);
+                    continue 'socket_retry;
+                }
+            };
+            socket.set_timeout(Some(Duration::from_secs(10)));
 
-            if let Err(e) = mqtt_sock.connect(endpoint).await {
+            if let Err(e) = socket.connect(endpoint).await {
                 log::error!("Failed to connect to MQTT broker: {:?}", e);
                 continue 'socket_retry;
             }
@@ -86,7 +139,7 @@ impl Mqtt {
             let mut client_tx = [0u8; BUF_SIZE];
             let mut client_rx = [0u8; BUF_SIZE];
             let mut client = MqttClient::<_, MAX_PROPERTIES, _>::new(
-                &mut mqtt_sock,
+                &mut socket,
                 &mut client_tx,
                 BUF_SIZE,
                 &mut client_rx,
@@ -136,6 +189,10 @@ impl Mqtt {
                         }
                     },
                 }
+                if self.wifi_stack.is_link_up() && self.wifi_stack.is_config_up() && !connection_is_wifi {
+                    log::info!("WiFi seems to be up, switching MQTT connection from modem to WiFi");
+                    continue 'socket_retry;
+                }
             }
         }
     }
@@ -160,7 +217,7 @@ impl Mqtt {
                 .send_message(
                     device_tracker_availability.topic.as_str(),
                     online.as_bytes(),
-                    QualityOfService::QoS1,
+                    QualityOfService::QoS0,
                     true,
                 )
                 .await
@@ -179,7 +236,7 @@ impl Mqtt {
             .send_message(
                 device_tracker.discovery_topic().0.as_str(),
                 device_tracker_str.as_bytes(),
-                QualityOfService::QoS1,
+                QualityOfService::QoS0,
                 true,
             )
             .await
@@ -205,7 +262,7 @@ impl Mqtt {
                             .send_message(
                                 device_tracker.json_attributes_topic.0.as_str(),
                                 data_str.as_bytes(),
-                                QualityOfService::QoS2,
+                                QualityOfService::QoS0,
                                 true,
                             )
                             .await
@@ -252,4 +309,16 @@ impl Serialize for SkipNulls {
             _ => self.0.serialize(serializer),
         }
     }
+}
+
+async fn get_host_ip<D: Driver>(host: &str, stack: &Stack<D>) -> anyhow::Result<Ipv4Address> {
+    stack
+        .dns_query(host, smoltcp::wire::DnsQueryType::A)
+        .await
+        .map_err(|e| anyhow!("Failed to query DNS for {}: {:?}", host, e))
+        .and_then(|res| {
+            res.first()
+                .map(|ip| Ok(Ipv4Address::from_bytes(ip.as_bytes())))
+                .unwrap_or_else(|| Err(anyhow!("No IP address found for {}", host)))
+        })
 }
