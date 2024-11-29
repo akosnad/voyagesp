@@ -1,17 +1,22 @@
-use core::str::FromStr;
-
+use alloc::borrow::ToOwned;
+use alloc::format;
 use anyhow::anyhow;
+use core::str::FromStr;
 use embassy_futures::select::{select3, Either3};
 use embassy_net::{driver::Driver, tcp::TcpSocket, Ipv4Address, Stack};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, once_lock::OnceLock,
+};
 use embassy_time::{Duration, Timer};
 use esp_hal::rng::Rng;
-use hass_types::{DeviceTrackerAttributes, Discoverable};
+use hass_types::{BinarySensor, DeviceTrackerAttributes, Discoverable, Publishable, Sensor, Topic};
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig},
     packet::v5::publish_packet::QualityOfService,
 };
 use serde::Serialize;
+
+use crate::PsuData;
 
 const BUF_SIZE: usize = 2048;
 const MAX_PROPERTIES: usize = 10;
@@ -23,7 +28,9 @@ type ModemStack = &'static embassy_net::Stack<&'static mut embassy_net_ppp::Devi
 
 #[derive(Debug)]
 pub enum Event {
-    DeviceTrackerStateChange(DeviceTrackerAttributes),
+    DeviceTracker(DeviceTrackerAttributes),
+    Ignition(bool),
+    Psu(PsuData),
 }
 
 type Endpoint = (Ipv4Address, u16);
@@ -32,6 +39,106 @@ struct Connection<'s> {
     socket: TcpSocket<'s>,
     endpoint: Endpoint,
     is_wifi: bool,
+}
+
+static DIAGNOSTIC_ENTITIES: OnceLock<DiagnosticEntities> = OnceLock::new();
+struct DiagnosticEntities {
+    battery_charging: BinarySensor,
+    battery_voltage: Sensor,
+    battery_charge_current: Sensor,
+    ext_voltage: Sensor,
+    ext_current: Sensor,
+    int_temperature: Sensor,
+}
+impl DiagnosticEntities {
+    pub fn get() -> &'static Self {
+        DIAGNOSTIC_ENTITIES.get_or_init(|| {
+            const TOPIC_PREFIX: &str = env!("DIAGNOSTIC_ENTITIES_TOPIC_PREFIX");
+            let config = &crate::config::SystemConfig::get();
+            let availability = config.device_tracker.availability.to_owned();
+            let device = config.device_tracker.device.clone();
+
+            macro_rules! sensor {
+                ($name:ident, $display_name:literal, $device_class:expr, $state_class:expr, $unit:literal) => {
+                    Sensor {
+                        availability: availability.clone(),
+                        device: device.clone(),
+                        unique_id: hass_types::UniqueId(
+                            format!("{}_{}", TOPIC_PREFIX, stringify!($name)).into(),
+                        ),
+                        name: ($display_name).into(),
+                        device_class: Some($device_class),
+                        state_class: Some($state_class),
+                        state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, stringify!($name))),
+                        entity_category: Some(hass_types::EntityCategory::diagnostic),
+                        suggested_display_precision: Some(2),
+                        unit_of_measurement: Some(($unit).into()),
+                        ..Default::default()
+                    }
+                };
+            }
+
+            macro_rules! binary_sensor {
+                ($name:ident, $display_name:literal, $device_class:expr) => {
+                    BinarySensor {
+                        availability: availability.clone(),
+                        device: device.clone(),
+                        unique_id: hass_types::UniqueId(
+                            format!("{}_{}", TOPIC_PREFIX, stringify!($name)).into(),
+                        ),
+                        name: ($display_name).into(),
+                        device_class: Some($device_class),
+                        state_topic: Topic(format!("{}/{}", TOPIC_PREFIX, stringify!($name))),
+                        entity_category: Some(hass_types::EntityCategory::diagnostic),
+                        ..Default::default()
+                    }
+                };
+            }
+
+            Self {
+                battery_charging: binary_sensor!(
+                    battery_charging,
+                    "Battery Charging",
+                    hass_types::BinarySensorDeviceClass::battery_charging
+                ),
+                battery_voltage: sensor!(
+                    battery_voltage,
+                    "Battery Voltage",
+                    hass_types::SensorDeviceClass::voltage,
+                    hass_types::SensorStateClass::Measurement,
+                    "V"
+                ),
+                battery_charge_current: sensor!(
+                    battery_charge_current,
+                    "Battery Charge Current",
+                    hass_types::SensorDeviceClass::current,
+                    hass_types::SensorStateClass::Measurement,
+                    "A"
+                ),
+                ext_voltage: sensor!(
+                    ext_voltage,
+                    "External Voltage",
+                    hass_types::SensorDeviceClass::voltage,
+                    hass_types::SensorStateClass::Measurement,
+                    "V"
+                ),
+                ext_current: sensor!(
+                    ext_current,
+                    "External Current",
+                    hass_types::SensorDeviceClass::current,
+                    hass_types::SensorStateClass::Measurement,
+                    "A"
+                ),
+                int_temperature: sensor!(
+                    int_temperature,
+                    "Internal Temperature",
+                    hass_types::SensorDeviceClass::temperature,
+                    hass_types::SensorStateClass::Measurement,
+                    "°C"
+                ),
+            }
+        })
+    }
 }
 
 pub struct Mqtt {
@@ -77,16 +184,13 @@ impl Mqtt {
 
         if self.wifi_stack.is_link_up() && self.wifi_stack.is_config_up() {
             let ip = Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
-                        .expect("invalid IP address for MQTT WiFi endpoint");
+                .expect("invalid IP address for MQTT WiFi endpoint");
 
             log::debug!("Using MQTT endpoint: {ip}:{port}");
 
             Ok(Connection {
                 socket: TcpSocket::new(self.wifi_stack, rx, tx),
-                endpoint: (
-                    ip,
-                    port,
-                ),
+                endpoint: (ip, port),
                 is_wifi: true,
             })
         } else if self.modem_stack.is_link_up() {
@@ -97,10 +201,7 @@ impl Mqtt {
 
             Ok(Connection {
                 socket: TcpSocket::new(self.modem_stack, rx, tx),
-                endpoint: (
-                    ip,
-                    port
-                ),
+                endpoint: (ip, port),
                 is_wifi: false,
             })
         } else {
@@ -189,7 +290,10 @@ impl Mqtt {
                         }
                     },
                 }
-                if self.wifi_stack.is_link_up() && self.wifi_stack.is_config_up() && !connection_is_wifi {
+                if self.wifi_stack.is_link_up()
+                    && self.wifi_stack.is_config_up()
+                    && !connection_is_wifi
+                {
                     log::info!("WiFi seems to be up, switching MQTT connection from modem to WiFi");
                     continue 'socket_retry;
                 }
@@ -201,8 +305,12 @@ impl Mqtt {
         &self,
         client: &mut MqttClient<'_, &mut TcpSocket<'_>, MAX_PROPERTIES, Rng>,
     ) -> anyhow::Result<()> {
-        let device_tracker = &crate::config::SystemConfig::get().device_tracker;
+        let crate::config::SystemConfig {
+            ref device_tracker,
+            ref ignition_sense_sensor,
+        } = &crate::config::SystemConfig::get();
 
+        // send birth message
         if let Some(device_tracker_availability) = device_tracker.availability.first() {
             let online = device_tracker_availability
                 .payload_available
@@ -224,18 +332,55 @@ impl Mqtt {
                 .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}"))?;
         }
 
-        let device_tracker_value = serde_json::to_value(device_tracker)
-            .map_err(|e| anyhow!("Failed to serialize device tracker: {e:?}"))?;
-        let device_tracker_str = serde_json::to_string(&SkipNulls(device_tracker_value))
-            .map_err(|e| anyhow!("Failed to serialize device tracker: {e:?}"))?;
+        self.send_discovery_config(client, device_tracker).await?;
+        self.send_discovery_config(client, ignition_sense_sensor)
+            .await?;
+
+        let DiagnosticEntities {
+            ref battery_charging,
+            ref battery_voltage,
+            ref battery_charge_current,
+            ref ext_voltage,
+            ref ext_current,
+            ref int_temperature,
+        } = DiagnosticEntities::get();
+
+        self.send_discovery_config(client, battery_charging).await?;
+        self.send_discovery_config(client, battery_voltage).await?;
+        self.send_discovery_config(client, battery_charge_current)
+            .await?;
+        self.send_discovery_config(client, ext_voltage).await?;
+        self.send_discovery_config(client, ext_current).await?;
+        self.send_discovery_config(client, int_temperature).await?;
+
+        Ok(())
+    }
+
+    async fn send_discovery_config(
+        &self,
+        client: &mut MqttClient<'_, &mut TcpSocket<'_>, MAX_PROPERTIES, Rng>,
+        entity: &(impl Discoverable + Serialize),
+    ) -> anyhow::Result<()> {
+        let config = {
+            let value = serde_json::to_value(entity)
+                .map_err(|e| anyhow!("Failed to serialize entity: {e:?}"))?;
+            serde_json::to_string(&SkipNulls(value))
+                .map_err(|e| anyhow!("Failed to serialize entity: {e:?}"))?
+        };
+
+        let discovery_topic = entity.discovery_topic();
+        let discovery_topic = discovery_topic.0.as_str();
+
         log::debug!(
-            "Sending device tracker discovery config: {}",
-            device_tracker_str
+            "Sending entity discovery config for {}: {}",
+            discovery_topic,
+            config
         );
+
         client
             .send_message(
-                device_tracker.discovery_topic().0.as_str(),
-                device_tracker_str.as_bytes(),
+                discovery_topic,
+                config.as_bytes(),
                 QualityOfService::QoS0,
                 true,
             )
@@ -252,24 +397,24 @@ impl Mqtt {
     ) -> anyhow::Result<()> {
         log::debug!("Handling event: {:?}", event);
         match event {
-            Event::DeviceTrackerStateChange(data) => {
-                let data_value = serde_json::to_value(data)
-                    .map_err(|e| anyhow!("Failed to serialize event data: {e:?}"))?;
-                match serde_json::to_string(&SkipNulls(data_value)) {
-                    Ok(data_str) => {
-                        let device_tracker = &crate::config::SystemConfig::get().device_tracker;
-                        client
-                            .send_message(
-                                device_tracker.json_attributes_topic.0.as_str(),
-                                data_str.as_bytes(),
-                                QualityOfService::QoS0,
-                                true,
-                            )
-                            .await
-                            .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}"))?;
-                    }
-                    Err(e) => anyhow::bail!("Failed to serialize event data: {e:?}"),
-                }
+            Event::DeviceTracker(data) => {
+                self.publish_entity_state(
+                    client,
+                    &crate::config::SystemConfig::get().device_tracker,
+                    data,
+                )
+                .await?;
+            }
+            Event::Ignition(state) => {
+                self.publish_entity_state(
+                    client,
+                    &crate::config::SystemConfig::get().ignition_sense_sensor,
+                    state,
+                )
+                .await?;
+            }
+            Event::Psu(psu_state) => {
+                self.publish_psu_state(client, psu_state).await?;
             }
         }
         Ok(())
@@ -277,6 +422,70 @@ impl Mqtt {
 
     pub async fn send_event(&self, event: Event) {
         self.event_queue.send(event).await;
+    }
+
+    async fn publish_psu_state(
+        &self,
+        client: &mut MqttClient<'_, &mut TcpSocket<'_>, MAX_PROPERTIES, Rng>,
+        psu_state: PsuData,
+    ) -> anyhow::Result<()> {
+        let PsuData {
+            ref battery_charging,
+            ref battery_voltage,
+            ref battery_charge_current,
+            ref ext_voltage,
+            ref ext_current,
+            ref temperature,
+        } = psu_state;
+        let DiagnosticEntities {
+            battery_charging: ref battery_charging_entity,
+            battery_voltage: ref battery_voltage_entity,
+            battery_charge_current: ref battery_charge_current_entity,
+            ext_voltage: ref ext_voltage_entity,
+            ext_current: ref ext_current_entity,
+            int_temperature: ref int_temperature_entity,
+        } = DiagnosticEntities::get();
+
+        self.publish_entity_state(client, battery_charging_entity, battery_charging)
+            .await?;
+        self.publish_entity_state(client, battery_voltage_entity, battery_voltage)
+            .await?;
+        self.publish_entity_state(
+            client,
+            battery_charge_current_entity,
+            battery_charge_current,
+        )
+        .await?;
+        self.publish_entity_state(client, ext_voltage_entity, ext_voltage)
+            .await?;
+        self.publish_entity_state(client, ext_current_entity, ext_current)
+            .await?;
+        self.publish_entity_state(client, int_temperature_entity, temperature)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn publish_entity_state(
+        &self,
+        client: &mut MqttClient<'_, &mut TcpSocket<'_>, MAX_PROPERTIES, Rng>,
+        entity: &impl Publishable,
+        state: impl Serialize,
+    ) -> anyhow::Result<()> {
+        let state_value = serde_json::to_value(state)
+            .map_err(|e| anyhow!("Failed to serialize event data: {e:?}"))?;
+        match serde_json::to_string(&SkipNulls(state_value)) {
+            Ok(state_str) => client
+                .send_message(
+                    entity.state_topic().0.as_str(),
+                    state_str.as_bytes(),
+                    QualityOfService::QoS0,
+                    false,
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}")),
+            Err(e) => anyhow::bail!("Failed to serialize event data: {e:?}"),
+        }
     }
 }
 

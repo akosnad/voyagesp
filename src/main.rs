@@ -4,7 +4,6 @@
 #![feature(async_closure)]
 
 use alloc::boxed::Box;
-use embassy_futures::select::{select, Either};
 use core::str::FromStr;
 use embassy_executor::{task, Spawner};
 use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
@@ -31,7 +30,48 @@ mod gps;
 mod modem;
 mod mqtt;
 
-use gps::Gps;
+const GPS_BAUD: u32 = 9600;
+const MODEM_BAUD: u32 = 115_200;
+
+const SYSTEM_EVENT_QUEUE_SIZE: usize = 5;
+const HEAP_SIZE: usize = 64 * 1024;
+
+const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
+const GPS_DATA_INTERVAL: Duration = Duration::from_secs(5);
+const IGNITION_SENSE_DEBOUNCE: Duration = Duration::from_secs(1);
+
+type SystemEventSender = embassy_sync::channel::Sender<
+    'static,
+    CriticalSectionRawMutex,
+    SystemEvent,
+    SYSTEM_EVENT_QUEUE_SIZE,
+>;
+type SystemEventReceiver = embassy_sync::channel::Receiver<
+    'static,
+    CriticalSectionRawMutex,
+    SystemEvent,
+    SYSTEM_EVENT_QUEUE_SIZE,
+>;
+
+type Psu = axp192::Axp192<esp_hal::i2c::I2c<'static, esp_hal::peripherals::I2C0, Blocking>>;
+type Gps = gps::Gps<GPS_BAUD>;
+
+#[derive(Debug)]
+pub enum SystemEvent {
+    IgnitionStateChange(bool),
+    GpsData(gps::GpsCoords),
+    PsuData(PsuData),
+}
+
+#[derive(Debug)]
+pub struct PsuData {
+    pub battery_charging: bool,
+    pub battery_voltage: f32,
+    pub battery_charge_current: f32,
+    pub ext_voltage: f32,
+    pub ext_current: f32,
+    pub temperature: f32,
+}
 
 #[export_name = "custom_halt"]
 pub fn custom_halt() -> ! {
@@ -40,21 +80,13 @@ pub fn custom_halt() -> ! {
     }
 }
 
-const GPS_BAUD: u32 = 9600;
-
-#[derive(Debug)]
-pub enum SystemEvent {
-    IgnitionOn,
-    IgnitionOff,
-}
-
 #[main]
 async fn main_task(spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_hal_embassy::init(timg0.timer0);
 
-    esp_alloc::heap_allocator!(72 * 1024);
+    esp_alloc::heap_allocator!(HEAP_SIZE);
 
     esp_println::logger::init_logger(log::LevelFilter::Debug);
 
@@ -62,8 +94,11 @@ async fn main_task(spawner: Spawner) {
 
     let ignition_sense = Input::new(io.pins.gpio14, esp_hal::gpio::Pull::Down);
     let event_channel = {
-        let chan: embassy_sync::channel::Channel<CriticalSectionRawMutex, SystemEvent, 5> =
-            embassy_sync::channel::Channel::new();
+        let chan: embassy_sync::channel::Channel<
+            CriticalSectionRawMutex,
+            SystemEvent,
+            SYSTEM_EVENT_QUEUE_SIZE,
+        > = embassy_sync::channel::Channel::new();
         let boxed = Box::new(chan);
         Box::leak(boxed)
     };
@@ -75,7 +110,7 @@ async fn main_task(spawner: Spawner) {
     // PSU
     let psu_i2c =
         esp_hal::i2c::I2c::new(peripherals.I2C0, io.pins.gpio21, io.pins.gpio22, 100.kHz());
-    let mut psu = make_static!(axp192::Axp192::new(psu_i2c));
+    let psu: &mut Psu = make_static!(axp192::Axp192::new(psu_i2c));
 
     psu.set_dcdc1_on(false).unwrap();
     psu.set_ldo2_on(false).unwrap();
@@ -132,7 +167,7 @@ async fn main_task(spawner: Spawner) {
     )
     .expect("Failed to initialize GPS UART");
 
-    let gps = {
+    let gps: &mut Gps = {
         let gps = gps::Gps::new(gps_uart)
             .await
             .expect("Failed to initialize GPS");
@@ -149,7 +184,6 @@ async fn main_task(spawner: Spawner) {
     let modem_pwrkey = Output::new(io.pins.gpio4, esp_hal::gpio::Level::Low);
     let modem_power_on = Output::new(io.pins.gpio25, esp_hal::gpio::Level::Low);
 
-    const MODEM_BAUD: u32 = 115_200;
     let modem_uart = esp_hal::uart::Uart::new_async_with_config(
         peripherals.UART2,
         uart::config::Config {
@@ -228,57 +262,80 @@ async fn main_task(spawner: Spawner) {
         .expect("Failed to spawn MQTT task");
 
     // System tasks
-    spawner.spawn(system_data_sender(mqtt, psu)).expect("Failed to spawn system data sender");
+    spawner
+        .spawn(system_event_handler(event_channel.receiver(), mqtt))
+        .expect("Failed to spawn system data sender");
+    spawner
+        .spawn(psu_state_task(psu, event_channel.sender()))
+        .expect("Failed to spawn PSU task");
+    spawner
+        .spawn(gps_data_fetcher(gps, event_channel.sender()))
+        .expect("Failed to spawn GPS data fetcher");
+}
 
-    let mut ignition = false;
+#[task]
+async fn gps_data_fetcher(gps: &'static Gps, event_sender: SystemEventSender) -> ! {
     loop {
-        let event = event_channel.receive();
-        let gps_coords = gps.get_coords();
-        match select(event, gps_coords).await {
-            Either::First(event) => match event {
-                SystemEvent::IgnitionOn => ignition = true,
-                SystemEvent::IgnitionOff => ignition = false,
-            },
-            Either::Second(Some(gps_coords)) => {
-                if ignition {
-                    mqtt.send_event(mqtt::Event::DeviceTrackerStateChange(gps_coords.into()))
-                        .await;
-                }
-                Timer::after(Duration::from_secs(5)).await;
+        if let Some(gps_coords) = gps.get_coords().await {
+            event_sender.send(SystemEvent::GpsData(gps_coords)).await;
+        }
+        Timer::after(GPS_DATA_INTERVAL).await;
+    }
+}
+
+#[task]
+async fn psu_state_task(psu: &'static mut Psu, event_sender: SystemEventSender) -> ! {
+    loop {
+        let data = PsuData {
+            battery_charging: psu.get_charging().unwrap(),
+            battery_voltage: psu.get_battery_voltage().unwrap(),
+            battery_charge_current: psu.get_battery_charge_current().unwrap(),
+            ext_voltage: psu.get_acin_voltage().unwrap(),
+            ext_current: psu.get_acin_current().unwrap(),
+            temperature: psu.get_internal_temperature().unwrap(),
+        };
+        event_sender.send(SystemEvent::PsuData(data)).await;
+
+        Timer::after(PSU_DATA_INTERVAL).await;
+    }
+}
+
+#[task]
+async fn system_event_handler(event_receiver: SystemEventReceiver, mqtt: &'static mqtt::Mqtt) -> ! {
+    loop {
+        match event_receiver.receive().await {
+            SystemEvent::IgnitionStateChange(ignition_state) => {
+                mqtt.send_event(mqtt::Event::Ignition(ignition_state)).await;
             }
-            Either::Second(None) => {
-                // GPS got no fix, ignore
+            SystemEvent::GpsData(gps_data) => {
+                mqtt.send_event(mqtt::Event::DeviceTracker(gps_data.into()))
+                    .await;
+            }
+            SystemEvent::PsuData(psu_state) => {
+                mqtt.send_event(mqtt::Event::Psu(psu_state)).await;
             }
         }
     }
 }
 
 #[task]
-async fn system_data_sender(
-    mqtt: &'static mqtt::Mqtt,
-    psu: &'static mut axp192::Axp192<esp_hal::i2c::I2c<'static, esp_hal::peripherals::I2C0, Blocking>>,
-) -> ! {
-    loop {
-        Timer::after(Duration::from_secs(5)).await;
-    }
-}
-
-#[task]
-async fn ignition_sense_task(
-    mut sense: Input<'static>,
-    event_chan: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, SystemEvent, 5>,
-) -> ! {
+async fn ignition_sense_task(sense: Input<'static>, event_sender: SystemEventSender) -> ! {
+    let mut last_level = None;
     loop {
         let level = sense.get_level();
-        log::info!("Ignition sense: {:?}", level);
-        event_chan
-            .send(match level {
-                esp_hal::gpio::Level::Low => SystemEvent::IgnitionOff,
-                esp_hal::gpio::Level::High => SystemEvent::IgnitionOn,
-            })
-            .await;
-        Timer::after(Duration::from_secs(1)).await;
-        sense.wait_for_any_edge().await;
+        if last_level
+            .map(|last_level| level != last_level)
+            .unwrap_or(true)
+        {
+            log::info!("Ignition sense: {:?}", level);
+            event_sender
+                .send(SystemEvent::IgnitionStateChange(
+                    level == esp_hal::gpio::Level::High,
+                ))
+                .await;
+        }
+        last_level = Some(level);
+        Timer::after(IGNITION_SENSE_DEBOUNCE).await;
     }
 }
 
@@ -352,7 +409,7 @@ async fn wifi_net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, Wi
 }
 
 #[task]
-async fn gps_task(gps: &'static Gps<GPS_BAUD>) {
+async fn gps_task(gps: &'static Gps) {
     gps.run().await;
 }
 

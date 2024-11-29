@@ -1,4 +1,4 @@
-use hass_types::DeviceTracker;
+use hass_types::{BinarySensor, DeviceTracker};
 use std::str::FromStr;
 
 #[derive(serde::Deserialize)]
@@ -11,7 +11,9 @@ struct Config {
     mqtt_modem_host: String,
     mqtt_port: usize,
     apn: String,
+    diagnostic_entities_topic_prefix: String,
     device_tracker_config: DeviceTracker,
+    ignition_sense_sensor_config: BinarySensor,
 }
 
 impl Config {
@@ -26,6 +28,14 @@ impl Config {
         assert!(self.mqtt_port > 0, "mqtt_port is invalid");
         assert!(self.mqtt_port < 65536, "mqtt_port is invalid");
         std::net::Ipv4Addr::from_str(&self.mqtt_wifi_ip).expect("mqtt_wifi_ip is invalid");
+        assert!(
+            !self.device_tracker_config.availability.is_empty(),
+            "device_tracker_config.availability should contain at least one element"
+        );
+        assert!(
+            !self.ignition_sense_sensor_config.availability.is_empty(),
+            "device_tracker_config.availability should contain at least one element"
+        );
     }
 
     fn export_vars(&self) {
@@ -37,6 +47,10 @@ impl Config {
         println!("cargo:rustc-env=MQTT_MODEM_HOST={}", self.mqtt_modem_host);
         println!("cargo:rustc-env=MQTT_PORT={}", self.mqtt_port);
         println!("cargo:rustc-env=APN={}", self.apn);
+        println!(
+            "cargo:rustc-env=DIAGNOSTIC_ENTITIES_TOPIC_PREFIX={}",
+            self.diagnostic_entities_topic_prefix
+        );
     }
 }
 
@@ -54,4 +68,9 @@ fn main() {
 
     uneval::to_out_dir(config.device_tracker_config, "device_tracker_config.rs")
         .expect("Failed to write device_tracker_config.rs");
+    uneval::to_out_dir(
+        config.ignition_sense_sensor_config,
+        "ignition_sense_sensor_config.rs",
+    )
+    .expect("Failed to write ignition_sense_sensor_config.rs");
 }
