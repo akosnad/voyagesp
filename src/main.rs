@@ -3,8 +3,8 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 
-use alloc::boxed::Box;
-use core::str::FromStr;
+use alloc::{boxed::Box, sync::Arc};
+use core::{str::FromStr, sync::atomic::AtomicBool};
 use embassy_executor::{task, Spawner};
 use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -21,6 +21,7 @@ use esp_wifi::wifi::{
     utils::create_network_interface, ClientConfiguration, Configuration, WifiController,
     WifiDevice, WifiEvent, WifiStaDevice, WifiState,
 };
+use mqtt::PublishEvent;
 use static_cell::make_static;
 
 extern crate alloc;
@@ -92,6 +93,7 @@ async fn main_task(spawner: Spawner) {
 
     let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
+    // Ignition sense
     let ignition_sense = Input::new(io.pins.gpio14, esp_hal::gpio::Pull::Down);
     let event_channel = {
         let chan: embassy_sync::channel::Channel<
@@ -103,8 +105,9 @@ async fn main_task(spawner: Spawner) {
         Box::leak(boxed)
     };
 
+    let ignition_state = Arc::new(AtomicBool::new(false));
     spawner
-        .spawn(ignition_sense_task(ignition_sense, event_channel.sender()))
+        .spawn(ignition_sense_task(ignition_sense, event_channel.sender(), ignition_state.clone()))
         .expect("Failed to spawn ignition sense task");
 
     // PSU
@@ -263,21 +266,35 @@ async fn main_task(spawner: Spawner) {
 
     // System tasks
     spawner
-        .spawn(system_event_handler(event_channel.receiver(), mqtt))
+        .spawn(mqtt_publisher_task(event_channel.receiver(), mqtt))
         .expect("Failed to spawn system data sender");
+    spawner
+        .spawn(gps_data_fetcher(
+            gps,
+            event_channel.sender(),
+            ignition_state,
+        ))
+        .expect("Failed to spawn GPS data fetcher");
     spawner
         .spawn(psu_state_task(psu, event_channel.sender()))
         .expect("Failed to spawn PSU task");
-    spawner
-        .spawn(gps_data_fetcher(gps, event_channel.sender()))
-        .expect("Failed to spawn GPS data fetcher");
 }
 
 #[task]
-async fn gps_data_fetcher(gps: &'static Gps, event_sender: SystemEventSender) -> ! {
+async fn gps_data_fetcher(
+    gps: &'static Gps,
+    event_sender: SystemEventSender,
+    ignition_state: Arc<AtomicBool>,
+) -> ! {
     loop {
-        if let Some(gps_coords) = gps.get_coords().await {
-            event_sender.send(SystemEvent::GpsData(gps_coords)).await;
+        if ignition_state.load(core::sync::atomic::Ordering::SeqCst) {
+            if let Some(gps_coords) = gps.get_coords().await {
+                    event_sender.send(SystemEvent::GpsData(gps_coords)).await;
+            } else {
+                log::warn!("Tried to get GPS data without fix");
+            }
+        } else {
+            log::debug!("GPS data fetcher: Ignition off, skipping GPS data fetch");
         }
         Timer::after(GPS_DATA_INTERVAL).await;
     }
@@ -301,24 +318,24 @@ async fn psu_state_task(psu: &'static mut Psu, event_sender: SystemEventSender) 
 }
 
 #[task]
-async fn system_event_handler(event_receiver: SystemEventReceiver, mqtt: &'static mqtt::Mqtt) -> ! {
+async fn mqtt_publisher_task(event_receiver: SystemEventReceiver, mqtt: &'static mqtt::Mqtt) -> ! {
     loop {
         match event_receiver.receive().await {
             SystemEvent::IgnitionStateChange(ignition_state) => {
-                mqtt.send_event(mqtt::Event::Ignition(ignition_state)).await;
+                mqtt.publish(PublishEvent::Ignition(ignition_state)).await;
             }
             SystemEvent::GpsData(gps_data) => {
-                mqtt.send_event(mqtt::Event::DeviceTracker(gps_data)).await;
+                mqtt.publish(PublishEvent::DeviceTracker(gps_data)).await;
             }
             SystemEvent::PsuData(psu_state) => {
-                mqtt.send_event(mqtt::Event::Psu(psu_state)).await;
+                mqtt.publish(PublishEvent::Psu(psu_state)).await;
             }
         }
     }
 }
 
 #[task]
-async fn ignition_sense_task(sense: Input<'static>, event_sender: SystemEventSender) -> ! {
+async fn ignition_sense_task(sense: Input<'static>, event_sender: SystemEventSender, ignition_state: Arc<AtomicBool>) -> ! {
     let mut last_level = None;
     loop {
         let level = sense.get_level();
@@ -326,11 +343,11 @@ async fn ignition_sense_task(sense: Input<'static>, event_sender: SystemEventSen
             .map(|last_level| level != last_level)
             .unwrap_or(true)
         {
+            let level = level == esp_hal::gpio::Level::High;
             log::info!("Ignition sense: {:?}", level);
+            ignition_state.store(level, core::sync::atomic::Ordering::SeqCst);
             event_sender
-                .send(SystemEvent::IgnitionStateChange(
-                    level == esp_hal::gpio::Level::High,
-                ))
+                .send(SystemEvent::IgnitionStateChange(level))
                 .await;
         }
         last_level = Some(level);

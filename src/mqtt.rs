@@ -27,7 +27,7 @@ type WifiStack =
 type ModemStack = &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>;
 
 #[derive(Debug)]
-pub enum Event {
+pub enum PublishEvent {
     DeviceTracker(GpsCoords),
     Ignition(bool),
     Psu(PsuData),
@@ -160,7 +160,7 @@ pub struct Mqtt {
     wifi_stack: WifiStack,
     modem_stack: ModemStack,
     config: ClientConfig<'static, MAX_PROPERTIES, esp_hal::rng::Rng>,
-    event_queue: Channel<CriticalSectionRawMutex, Event, EVENT_QUEUE_SIZE>,
+    pub_queue: Channel<CriticalSectionRawMutex, PublishEvent, EVENT_QUEUE_SIZE>,
 }
 
 impl Mqtt {
@@ -186,7 +186,7 @@ impl Mqtt {
             wifi_stack,
             modem_stack,
             config,
-            event_queue: Channel::new(),
+            pub_queue: Channel::new(),
         }
     }
 
@@ -276,13 +276,13 @@ impl Mqtt {
             log::info!("MQTT entities initialized");
 
             'event_loop: loop {
-                let event = self.event_queue.ready_to_receive();
+                let event = self.pub_queue.ready_to_receive();
                 let receive = client.receive_message();
                 let timeout = Timer::after(Duration::from_secs(5));
                 match select3(event, receive, timeout).await {
                     Either3::First(_) => {
-                        let event = self.event_queue.receive().await;
-                        match self.handle_event(&mut client, event).await {
+                        let event = self.pub_queue.receive().await;
+                        match self.handle_publish_event(&mut client, event).await {
                             Ok(_) => {}
                             Err(e) => {
                                 log::error!("Failed to handle event: {:?}", e);
@@ -407,14 +407,14 @@ impl Mqtt {
         Ok(())
     }
 
-    async fn handle_event(
+    async fn handle_publish_event(
         &self,
         client: &mut MqttClient<'_, &mut TcpSocket<'_>, MAX_PROPERTIES, Rng>,
-        event: Event,
+        event: PublishEvent,
     ) -> anyhow::Result<()> {
         log::debug!("Handling event: {:?}", event);
         match event {
-            Event::DeviceTracker(data) => {
+            PublishEvent::DeviceTracker(data) => {
                 let attrs: DeviceTrackerAttributes = data.into();
                 self.publish_entity_state(
                     client,
@@ -430,7 +430,7 @@ impl Mqtt {
                 )
                 .await?;
             }
-            Event::Ignition(state) => {
+            PublishEvent::Ignition(state) => {
                 self.publish_entity_state(
                     client,
                     &crate::config::SystemConfig::get().ignition_sense_sensor,
@@ -438,15 +438,15 @@ impl Mqtt {
                 )
                 .await?;
             }
-            Event::Psu(psu_state) => {
+            PublishEvent::Psu(psu_state) => {
                 self.publish_psu_state(client, psu_state).await?;
             }
         }
         Ok(())
     }
 
-    pub async fn send_event(&self, event: Event) {
-        self.event_queue.send(event).await;
+    pub async fn publish(&self, event: PublishEvent) {
+        self.pub_queue.send(event).await;
     }
 
     async fn publish_psu_state(
