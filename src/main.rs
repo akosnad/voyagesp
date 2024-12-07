@@ -107,7 +107,11 @@ async fn main_task(spawner: Spawner) {
 
     let ignition_state = Arc::new(AtomicBool::new(false));
     spawner
-        .spawn(ignition_sense_task(ignition_sense, event_channel.sender(), ignition_state.clone()))
+        .spawn(ignition_sense_task(
+            ignition_sense,
+            event_channel.sender(),
+            ignition_state.clone(),
+        ))
         .expect("Failed to spawn ignition sense task");
 
     // PSU
@@ -120,6 +124,10 @@ async fn main_task(spawner: Spawner) {
     psu.set_ldo3_on(false).unwrap();
     psu.set_dcdc2_on(false).unwrap();
     psu.set_exten_on(false).unwrap();
+    psu.set_acin_voltage_adc_enable(true).unwrap();
+    psu.set_acin_current_adc_enable(true).unwrap();
+    psu.set_battery_voltage_adc_enable(true).unwrap();
+    psu.set_battery_current_adc_enable(true).unwrap();
 
     // WIFI
     let mut rng = Rng::new(peripherals.RNG);
@@ -289,9 +297,9 @@ async fn gps_data_fetcher(
     loop {
         if ignition_state.load(core::sync::atomic::Ordering::SeqCst) {
             if let Some(gps_coords) = gps.get_coords().await {
-                    event_sender.send(SystemEvent::GpsData(gps_coords)).await;
+                event_sender.send(SystemEvent::GpsData(gps_coords)).await;
             } else {
-                log::warn!("Tried to get GPS data without fix");
+                log::warn!("Tried to get GPS data before initialization");
             }
         } else {
             log::debug!("GPS data fetcher: Ignition off, skipping GPS data fetch");
@@ -335,7 +343,11 @@ async fn mqtt_publisher_task(event_receiver: SystemEventReceiver, mqtt: &'static
 }
 
 #[task]
-async fn ignition_sense_task(sense: Input<'static>, event_sender: SystemEventSender, ignition_state: Arc<AtomicBool>) -> ! {
+async fn ignition_sense_task(
+    sense: Input<'static>,
+    event_sender: SystemEventSender,
+    ignition_state: Arc<AtomicBool>,
+) -> ! {
     let mut last_level = None;
     loop {
         let level = sense.get_level();

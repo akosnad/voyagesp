@@ -7,7 +7,7 @@ use embassy_net::{driver::Driver, tcp::TcpSocket, Ipv4Address, Stack};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, once_lock::OnceLock,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, TimeoutError, Timer, WithTimeout};
 use esp_hal::rng::Rng;
 use hass_types::{BinarySensor, DeviceTrackerAttributes, Discoverable, Publishable, Sensor, Topic};
 use rust_mqtt::{
@@ -208,7 +208,7 @@ impl Mqtt {
                 endpoint: (ip, port),
                 is_wifi: true,
             })
-        } else if self.modem_stack.is_link_up() {
+        } else if self.modem_stack.is_link_up() && self.modem_stack.is_config_up() {
             let Ok(ip) = get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await else {
                 anyhow::bail!("Failed to get IP address for MQTT modem endpoint");
             };
@@ -282,10 +282,18 @@ impl Mqtt {
                 match select3(event, receive, timeout).await {
                     Either3::First(_) => {
                         let event = self.pub_queue.receive().await;
-                        match self.handle_publish_event(&mut client, event).await {
-                            Ok(_) => {}
-                            Err(e) => {
+                        match self
+                            .handle_publish_event(&mut client, event)
+                            .with_timeout(Duration::from_secs(15))
+                            .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
                                 log::error!("Failed to handle event: {:?}", e);
+                                break 'event_loop;
+                            }
+                            Err(TimeoutError) => {
+                                log::error!("Handling event timed out");
                                 break 'event_loop;
                             }
                         }
@@ -297,20 +305,21 @@ impl Mqtt {
                         log::error!("Failed to receive MQTT message: {:?}", e);
                         break 'event_loop;
                     }
-                    Either3::Third(_) => match client.send_ping().await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log::error!("Failed to send MQTT ping: {:?}", e);
-                            break 'event_loop;
-                        }
-                    },
+                    Either3::Third(_) => {}
+                }
+                match client.send_ping().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("Failed to send MQTT ping: {:?}", e);
+                        break 'event_loop;
+                    }
                 }
                 if self.wifi_stack.is_link_up()
                     && self.wifi_stack.is_config_up()
                     && !connection_is_wifi
                 {
                     log::info!("WiFi seems to be up, switching MQTT connection from modem to WiFi");
-                    continue 'socket_retry;
+                    break 'event_loop;
                 }
             }
         }
@@ -381,7 +390,7 @@ impl Mqtt {
         let config = {
             let value = serde_json::to_value(entity)
                 .map_err(|e| anyhow!("Failed to serialize entity: {e:?}"))?;
-            serde_json::to_string(&SkipNulls(value))
+            serde_json::to_string(&SkipNulls(&value))
                 .map_err(|e| anyhow!("Failed to serialize entity: {e:?}"))?
         };
 
@@ -415,13 +424,15 @@ impl Mqtt {
         log::debug!("Handling event: {:?}", event);
         match event {
             PublishEvent::DeviceTracker(data) => {
-                let attrs: DeviceTrackerAttributes = data.into();
-                self.publish_entity_state(
-                    client,
-                    &crate::config::SystemConfig::get().device_tracker,
-                    attrs,
-                )
-                .await?;
+                if data.is_fixed {
+                    let attrs: DeviceTrackerAttributes = data.into();
+                    self.publish_entity_state(
+                        client,
+                        &crate::config::SystemConfig::get().device_tracker,
+                        attrs,
+                    )
+                    .await?;
+                }
 
                 self.publish_entity_state(
                     client,
@@ -492,7 +503,7 @@ impl Mqtt {
     ) -> anyhow::Result<()> {
         let state_value = serde_json::to_value(state)
             .map_err(|e| anyhow!("Failed to serialize event data: {e:?}"))?;
-        match serde_json::to_string(&SkipNulls(state_value)) {
+        match serde_json::to_string(&SkipNulls(&state_value)) {
             Ok(state_str) => client
                 .send_message(
                     entity.state_topic().0.as_str(),
@@ -508,8 +519,8 @@ impl Mqtt {
 }
 
 #[derive(Debug)]
-struct SkipNulls(serde_json::Value);
-impl Serialize for SkipNulls {
+struct SkipNulls<'v>(&'v serde_json::Value);
+impl<'v> Serialize for SkipNulls<'v> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer + ?Sized,
@@ -521,7 +532,7 @@ impl Serialize for SkipNulls {
                 let map = map.iter().filter(|(_, v)| !v.is_null());
                 let mut ser = serializer.serialize_map(None)?;
                 for (k, v) in map {
-                    ser.serialize_entry(k, &SkipNulls(v.clone()))?;
+                    ser.serialize_entry(k, &SkipNulls(v))?;
                 }
                 ser.end()
             }
@@ -529,7 +540,7 @@ impl Serialize for SkipNulls {
                 let arr = arr.iter().filter(|v| !v.is_null());
                 let mut ser = serializer.serialize_seq(None)?;
                 for v in arr {
-                    ser.serialize_element(&SkipNulls(v.clone()))?;
+                    ser.serialize_element(&SkipNulls(v))?;
                 }
                 ser.end()
             }

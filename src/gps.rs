@@ -15,6 +15,7 @@ pub struct GpsCoords {
     pub height: f64,
     pub horiz_accuracy: u32,
     pub satellite_count: u8,
+    pub is_fixed: bool,
 }
 
 impl From<ublox::NavPvtRef<'_>> for GpsCoords {
@@ -25,6 +26,7 @@ impl From<ublox::NavPvtRef<'_>> for GpsCoords {
             height: nav.height_meters(),
             horiz_accuracy: nav.horiz_accuracy(),
             satellite_count: nav.num_satellites(),
+            is_fixed: nav.fix_type() != GpsFix::NoFix && nav.fix_type() != GpsFix::TimeOnlyFix,
         }
     }
 }
@@ -117,12 +119,7 @@ impl<const BAUD: u32> Gps<BAUD> {
                     Some(Ok(PacketRef::NavPvt(nav))) => {
                         trace!("Positional data: {:?}", nav);
                         let mut data = self.coords.lock().await;
-                        *data = {
-                            match nav.fix_type() {
-                                GpsFix::Fix2D | GpsFix::Fix3D => Some(nav.into()),
-                                _ => None,
-                            }
-                        };
+                        *data = Some(nav.into());
                     }
                     Some(Ok(packet)) => {
                         trace!("Received packet: {:?}", packet);
