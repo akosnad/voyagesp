@@ -196,7 +196,7 @@ impl ModemInterface {
                 log::info!("Modem entered command mode");
                 *mode = Mode::Command;
 
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+                embassy_time::Timer::after_millis(100).await;
                 pins.dtr.set_high();
 
                 Ok(())

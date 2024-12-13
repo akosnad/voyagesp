@@ -21,6 +21,8 @@ use crate::{gps::GpsCoords, PsuData};
 const BUF_SIZE: usize = 2048;
 const MAX_PROPERTIES: usize = 10;
 const EVENT_QUEUE_SIZE: usize = 5;
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(35);
+const MQTT_KEEPALIVE_INTERVAL: usize = 30;
 
 type WifiStack =
     &'static embassy_net::Stack<esp_wifi::wifi::WifiDevice<'static, esp_wifi::wifi::WifiStaDevice>>;
@@ -179,7 +181,7 @@ impl Mqtt {
                 .unwrap_or("offline");
             config.add_will(&availability.topic, payload_offline.as_bytes(), true);
         }
-        config.keep_alive = 15;
+        config.keep_alive = MQTT_KEEPALIVE_INTERVAL as u16;
         config.max_packet_size = (BUF_SIZE as u32) - 1;
 
         Self {
@@ -209,8 +211,9 @@ impl Mqtt {
                 is_wifi: true,
             })
         } else if self.modem_stack.is_link_up() && self.modem_stack.is_config_up() {
-            let Ok(ip) = get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await else {
-                anyhow::bail!("Failed to get IP address for MQTT modem endpoint");
+            let ip = match get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await {
+                Ok(ip) => ip,
+                Err(e) => anyhow::bail!("Failed to get IP address for MQTT modem endpoint: {e:?}"),
             };
             log::debug!("Using MQTT endpoint: {ip}:{port}");
 
@@ -244,7 +247,7 @@ impl Mqtt {
                     continue 'socket_retry;
                 }
             };
-            socket.set_timeout(Some(Duration::from_secs(10)));
+            socket.set_timeout(Some(SOCKET_TIMEOUT));
 
             if let Err(e) = socket.connect(endpoint).await {
                 log::error!("Failed to connect to MQTT broker: {:?}", e);
@@ -284,7 +287,7 @@ impl Mqtt {
                         let event = self.pub_queue.receive().await;
                         match self
                             .handle_publish_event(&mut client, event)
-                            .with_timeout(Duration::from_secs(15))
+                            .with_timeout(Duration::from_secs(30))
                             .await
                         {
                             Ok(Ok(_)) => {}

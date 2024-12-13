@@ -91,44 +91,50 @@ impl Modem {
             .subscribe()
             .expect("Failed to subscribe to URC channel");
 
-        {
-            let mut state = self.state.lock().await;
-            match *state {
-                ModemState::Uninitialized => {
-                    let interface = self.interface.lock().await;
-                    *state = ModemState::Initializing;
-                    while let Err(e) = interface.init_hardware().await {
-                        log::error!("Failed to initialize modem: {:?}", e);
-                    }
-                    *state = ModemState::HardwareReady;
-                }
-                _ => panic!("Modem task already running"),
-            }
-        }
-        let mut int = self.interface.lock().await;
-
-        self.dump_info(&mut int)
-            .await
-            .map_err(|e| log::error!("Failed to dump info: {:?}", e))
-            .ok();
-
-        loop {
-            let future = urc_subcriber
-                .next_message()
-                .with_timeout(Duration::from_secs(3));
-            if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
-                self.handle_urc(&mut int, urc)
-                    .await
-                    .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
-                    .ok();
-            }
-
+        'init: loop {
             {
-                let mut state_guard = self.state.lock().await;
-                let pending_state = state_guard.clone();
+                let mut state = self.state.lock().await;
+                match *state {
+                    ModemState::Uninitialized => {
+                        let interface = self.interface.lock().await;
+                        *state = ModemState::Initializing;
+                        while let Err(e) = interface.init_hardware().await {
+                            log::error!("Failed to initialize modem: {:?}", e);
+                        }
+                        *state = ModemState::HardwareReady;
+                    }
+                    _ => panic!("Modem task already running"),
+                }
+            }
+            let mut int = self.interface.lock().await;
 
-                if let Ok(next_state) = self.handle_state_change(&mut int, pending_state).await {
-                    *state_guard = next_state;
+            self.dump_info(&mut int)
+                .await
+                .map_err(|e| log::error!("Failed to dump info: {:?}", e))
+                .ok();
+
+            loop {
+                let future = urc_subcriber
+                    .next_message()
+                    .with_timeout(Duration::from_secs(3));
+                if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
+                    self.handle_urc(&mut int, urc)
+                        .await
+                        .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
+                        .ok();
+                }
+
+                {
+                    let mut state_guard = self.state.lock().await;
+                    let pending_state = state_guard.clone();
+
+                    match self.handle_state_change(&mut int, pending_state).await {
+                        Ok(next_state) => *state_guard = next_state,
+                        Err(e) => {
+                            log::error!("Failed to handle state change: {:?}", e);
+                            continue 'init;
+                        }
+                    }
                 }
             }
         }
@@ -185,6 +191,9 @@ impl Modem {
                 }
             }
             ModemState::SimOnline => {
+                // Wait for network registration
+                Timer::after(Duration::from_secs(5)).await;
+
                 int.command(&lib::at::cip::SetPDPContext {
                     cid: 1,
                     pdp_type: heapless::String::from_str("IP").unwrap(),
