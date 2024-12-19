@@ -23,6 +23,7 @@ const MAX_PROPERTIES: usize = 10;
 const EVENT_QUEUE_SIZE: usize = 5;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(35);
 const MQTT_KEEPALIVE_INTERVAL: usize = 30;
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 type WifiStack =
     &'static embassy_net::Stack<esp_wifi::wifi::WifiDevice<'static, esp_wifi::wifi::WifiStaDevice>>;
@@ -249,9 +250,20 @@ impl Mqtt {
             };
             socket.set_timeout(Some(SOCKET_TIMEOUT));
 
-            if let Err(e) = socket.connect(endpoint).await {
-                log::error!("Failed to connect to MQTT broker: {:?}", e);
-                continue 'socket_retry;
+            match socket
+                .connect(endpoint)
+                .with_timeout(OPERATION_TIMEOUT)
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    log::error!("Failed to connect to MQTT broker: {:?}", e);
+                    continue 'socket_retry;
+                }
+                Err(TimeoutError) => {
+                    log::error!("Failed to connect to MQTT broker: timeout");
+                    continue 'socket_retry;
+                }
             }
             log::info!("MQTT socket connected");
 
@@ -266,9 +278,20 @@ impl Mqtt {
                 self.config.clone(),
             );
 
-            if let Err(e) = client.connect_to_broker().await {
-                log::error!("Failed to connect to MQTT broker: {:?}", e);
-                continue 'socket_retry;
+            match client
+                .connect_to_broker()
+                .with_timeout(OPERATION_TIMEOUT)
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Err(TimeoutError) => {
+                    log::error!("Failed to connect to MQTT broker: timeout");
+                    continue 'socket_retry;
+                }
+                Ok(Err(e)) => {
+                    log::error!("Failed to connect to MQTT broker: {:?}", e);
+                    continue 'socket_retry;
+                }
             }
             log::info!("MQTT broker connected");
 
@@ -285,20 +308,9 @@ impl Mqtt {
                 match select3(event, receive, timeout).await {
                     Either3::First(_) => {
                         let event = self.pub_queue.receive().await;
-                        match self
-                            .handle_publish_event(&mut client, event)
-                            .with_timeout(Duration::from_secs(30))
-                            .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => {
-                                log::error!("Failed to handle event: {:?}", e);
-                                break 'event_loop;
-                            }
-                            Err(TimeoutError) => {
-                                log::error!("Handling event timed out");
-                                break 'event_loop;
-                            }
+                        if let Err(e) = self.handle_publish_event(&mut client, event).await {
+                            log::error!("Failed to handle event: {:?}", e);
+                            break 'event_loop;
                         }
                     }
                     Either3::Second(Ok((topic, _payload))) => {
@@ -310,10 +322,14 @@ impl Mqtt {
                     }
                     Either3::Third(_) => {}
                 }
-                match client.send_ping().await {
-                    Ok(_) => {}
-                    Err(e) => {
+                match client.send_ping().with_timeout(OPERATION_TIMEOUT).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
                         log::error!("Failed to send MQTT ping: {:?}", e);
+                        break 'event_loop;
+                    }
+                    Err(TimeoutError) => {
+                        log::error!("Failed to send MQTT ping: timeout");
                         break 'event_loop;
                     }
                 }
@@ -355,7 +371,9 @@ impl Mqtt {
                     QualityOfService::QoS0,
                     true,
                 )
+                .with_timeout(OPERATION_TIMEOUT)
                 .await
+                .map_err(|_| anyhow!("Failed to send MQTT message: timeout"))?
                 .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}"))?;
         }
 
@@ -413,7 +431,9 @@ impl Mqtt {
                 QualityOfService::QoS0,
                 true,
             )
+            .with_timeout(OPERATION_TIMEOUT)
             .await
+            .map_err(|_| anyhow!("Failed to send MQTT message: timeout"))?
             .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}"))?;
 
         Ok(())
