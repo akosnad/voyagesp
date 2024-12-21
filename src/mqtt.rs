@@ -234,7 +234,6 @@ impl Mqtt {
     pub async fn run(&self) -> ! {
         'socket_retry: loop {
             log::debug!("Starting MQTT stack...");
-            Timer::after(Duration::from_secs(5)).await;
 
             let mut mqtt_rx = [0u8; 128];
             let mut mqtt_tx = [0u8; 128];
@@ -246,6 +245,7 @@ impl Mqtt {
                 Ok(res) => res,
                 Err(e) => {
                     log::error!("Failed to setup MQTT socket: {:?}", e);
+                    Timer::after(Duration::from_secs(5)).await;
                     continue 'socket_retry;
                 }
             };

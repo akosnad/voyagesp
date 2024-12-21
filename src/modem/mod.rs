@@ -183,7 +183,7 @@ impl Modem {
                     .command(&lib::at::general::GetSignalQuality)
                     .await
                     .map_err(|e| anyhow!("Failed to get signal quality: {e:?}"))?;
-                if sig.rssi > 0 && sig.ber > 0 {
+                if sig.rssi > 0 || sig.ber > 0 {
                     log::info!("Modem signal acquired");
                     Ok(ModemState::SimOnline)
                 } else {
@@ -216,6 +216,12 @@ impl Modem {
                 .map_err(|e| anyhow!("Failed to bring up wireless connection: {:?}", e))?;
 
                 Ok(ModemState::GprsOnline)
+            }
+            ModemState::GprsOnline => {
+                // let URC get flushed out (if any), then resume PPP
+                Timer::after(Duration::from_secs(2)).await;
+                int.data_mode().await?;
+                Ok(current_state)
             }
             ModemState::PPPFailed => {
                 int.command_mode().await?;
