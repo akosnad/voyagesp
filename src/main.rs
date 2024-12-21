@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
+#![feature(impl_trait_in_assoc_type)]
 
 use alloc::{boxed::Box, sync::Arc};
 use core::{str::FromStr, sync::atomic::AtomicBool};
@@ -424,7 +425,7 @@ async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
         match controller.connect().await {
             Ok(_) => log::info!("Wifi connected"),
             Err(e) => {
-                log::error!("Failed to connect to WiFi: {:?}", e);
+                log::warn!("Failed to connect to WiFi: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await
             }
         }

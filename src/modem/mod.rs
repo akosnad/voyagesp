@@ -91,49 +91,48 @@ impl Modem {
             .subscribe()
             .expect("Failed to subscribe to URC channel");
 
-        'init: loop {
-            {
-                let mut state = self.state.lock().await;
-                match *state {
-                    ModemState::Uninitialized => {
-                        let interface = self.interface.lock().await;
-                        *state = ModemState::Initializing;
-                        while let Err(e) = interface.init_hardware().await {
-                            log::error!("Failed to initialize modem: {:?}", e);
-                        }
-                        *state = ModemState::HardwareReady;
+        {
+            let mut state = self.state.lock().await;
+            match *state {
+                ModemState::Uninitialized => {
+                    let interface = self.interface.lock().await;
+                    *state = ModemState::Initializing;
+                    while let Err(e) = interface.init_hardware().await {
+                        log::error!("Failed to initialize modem: {:?}", e);
                     }
-                    _ => panic!("Modem task already running"),
+                    *state = ModemState::HardwareReady;
                 }
+                _ => panic!("Modem task already running"),
             }
-            let mut int = self.interface.lock().await;
+        }
+        let mut int = self.interface.lock().await;
 
-            self.dump_info(&mut int)
-                .await
-                .map_err(|e| log::error!("Failed to dump info: {:?}", e))
-                .ok();
+        self.dump_info(&mut int)
+            .await
+            .map_err(|e| log::error!("Failed to dump info: {:?}", e))
+            .ok();
 
-            loop {
-                let future = urc_subcriber
-                    .next_message()
-                    .with_timeout(Duration::from_secs(3));
-                if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
-                    self.handle_urc(&mut int, urc)
-                        .await
-                        .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
-                        .ok();
-                }
+        'main: loop {
+            let future = urc_subcriber
+                .next_message()
+                .with_timeout(Duration::from_secs(3));
+            if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
+                self.handle_urc(&mut int, urc)
+                    .await
+                    .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
+                    .ok();
+            }
 
-                {
-                    let mut state_guard = self.state.lock().await;
-                    let pending_state = state_guard.clone();
+            {
+                let mut state_guard = self.state.lock().await;
+                let pending_state = state_guard.clone();
 
-                    match self.handle_state_change(&mut int, pending_state).await {
-                        Ok(next_state) => *state_guard = next_state,
-                        Err(e) => {
-                            log::error!("Failed to handle state change: {:?}", e);
-                            continue 'init;
-                        }
+                match self.handle_state_change(&mut int, pending_state).await {
+                    Ok(next_state) => *state_guard = next_state,
+                    Err(e) => {
+                        log::error!("Failed to handle state change: {:?}", e);
+                        *state_guard = ModemState::SimReady;
+                        continue 'main;
                     }
                 }
             }
@@ -179,6 +178,7 @@ impl Modem {
     ) -> anyhow::Result<ModemState> {
         match current_state {
             ModemState::SimReady => {
+                int.command_mode().await?;
                 let sig = int
                     .command(&lib::at::general::GetSignalQuality)
                     .await
@@ -193,6 +193,7 @@ impl Modem {
             ModemState::SimOnline => {
                 // Wait for network registration
                 Timer::after(Duration::from_secs(5)).await;
+                int.command_mode().await?;
 
                 int.command(&lib::at::cip::SetPDPContext {
                     cid: 1,

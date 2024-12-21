@@ -23,7 +23,7 @@ const MAX_PROPERTIES: usize = 10;
 const EVENT_QUEUE_SIZE: usize = 5;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(35);
 const MQTT_KEEPALIVE_INTERVAL: usize = 30;
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 type WifiStack =
     &'static embassy_net::Stack<esp_wifi::wifi::WifiDevice<'static, esp_wifi::wifi::WifiStaDevice>>;
@@ -233,6 +233,7 @@ impl Mqtt {
     /// Should be only called once
     pub async fn run(&self) -> ! {
         'socket_retry: loop {
+            log::debug!("Starting MQTT stack...");
             Timer::after(Duration::from_secs(5)).await;
 
             let mut mqtt_rx = [0u8; 128];
@@ -265,7 +266,10 @@ impl Mqtt {
                     continue 'socket_retry;
                 }
             }
-            log::info!("MQTT socket connected");
+            log::info!(
+                "MQTT socket connected up over {}",
+                if connection_is_wifi { "WiFi" } else { "modem" }
+            );
 
             let mut client_tx = [0u8; BUF_SIZE];
             let mut client_rx = [0u8; BUF_SIZE];
@@ -359,11 +363,6 @@ impl Mqtt {
                 .payload_available
                 .as_deref()
                 .unwrap_or("online");
-            log::debug!(
-                "Sending online ({}) message for {}",
-                online,
-                device_tracker_availability.topic
-            );
             client
                 .send_message(
                     device_tracker_availability.topic.as_str(),
@@ -417,12 +416,6 @@ impl Mqtt {
 
         let discovery_topic = entity.discovery_topic();
         let discovery_topic = discovery_topic.0.as_str();
-
-        log::debug!(
-            "Sending entity discovery config for {}: {}",
-            discovery_topic,
-            config
-        );
 
         client
             .send_message(
@@ -534,7 +527,9 @@ impl Mqtt {
                     QualityOfService::QoS0,
                     false,
                 )
+                .with_timeout(OPERATION_TIMEOUT)
                 .await
+                .map_err(|_| anyhow!("Failed to send MQTT message: timeout"))?
                 .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}")),
             Err(e) => anyhow::bail!("Failed to serialize event data: {e:?}"),
         }

@@ -2,6 +2,8 @@ use atat::asynch::AtatClient as _;
 use atat::{
     nom::FindSubstring, AtatIngress as _, DefaultDigester, Ingress, ResponseSlot, UrcChannel,
 };
+use embassy_sync::signal::Signal;
+use embassy_time::Instant;
 use static_cell::make_static;
 
 use super::*;
@@ -9,8 +11,10 @@ use super::*;
 pub const INGRESS_BUF_SIZE: usize = 64;
 pub const URC_CAPACITY: usize = 8;
 pub const URC_SUBSCRIBERS: usize = 3;
-const COMMAND_PIPE_SIZE: usize = 16;
-const DATA_PIPE_SIZE: usize = 32;
+const COMMAND_PIPE_SIZE: usize = 64;
+const DATA_PIPE_SIZE: usize = 2048;
+const UART_CMD_BUF_SIZE: usize = COMMAND_PIPE_SIZE;
+const UART_DATA_BUF_SIZE: usize = DATA_PIPE_SIZE;
 
 pub static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
 
@@ -24,6 +28,9 @@ pub type DataRx = embassy_sync::pipe::Reader<'static, CriticalSectionRawMutex, D
 pub type DataTx = embassy_sync::pipe::Writer<'static, CriticalSectionRawMutex, DATA_PIPE_SIZE>;
 
 type CommandClient = atat::asynch::Client<'static, CommandTx, INGRESS_BUF_SIZE>;
+
+const CONNECT: &str = "CONNECT\r\n";
+const OK: &[u8] = b"OK\r\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum Mode {
@@ -41,7 +48,8 @@ struct Pins {
 pub struct ModemInterface {
     pins: Arc<Mutex<CriticalSectionRawMutex, Pins>>,
     cmd_client: Arc<Mutex<CriticalSectionRawMutex, CommandClient>>,
-    mode: Arc<Mutex<CriticalSectionRawMutex, Mode>>,
+    mode_signal: Arc<Signal<CriticalSectionRawMutex, Mode>>,
+    mode_result_signal: Arc<Signal<CriticalSectionRawMutex, anyhow::Result<()>>>,
 }
 
 impl ModemInterface {
@@ -92,31 +100,33 @@ impl ModemInterface {
             atat::Config::default(),
         );
 
-        spawner
-            .spawn(ri_task(ri))
-            .map_err(|e| anyhow!("Failed to spawn RI task: {e:?}"))?;
-
-        let mode: Arc<Mutex<CriticalSectionRawMutex, Mode>> = Default::default();
+        let mode_signal = Arc::new(Signal::new());
+        let mode_result_signal = Arc::new(Signal::new());
+        let pins = Arc::new(Mutex::new(Pins {
+            dtr,
+            pwrkey,
+            power_on,
+        }));
         spawner
             .spawn(io_task(
                 uart,
-                mode.clone(),
+                mode_signal.clone(),
+                mode_result_signal.clone(),
                 cmd_tx_reader,
                 cmd_rx_writer,
                 data_tx_reader,
                 data_rx_writer,
+                pins.clone(),
+                ri,
             ))
             .map_err(|e| anyhow!("Failed to spawn IO task: {e:?}"))?;
 
         Ok((
             Self {
-                pins: Arc::new(Mutex::new(Pins {
-                    dtr,
-                    pwrkey,
-                    power_on,
-                })),
+                pins,
                 cmd_client: Arc::new(Mutex::new(cmd_client)),
-                mode,
+                mode_signal,
+                mode_result_signal,
             },
             data_tx_writer,
             data_rx_reader,
@@ -167,41 +177,15 @@ impl ModemInterface {
     }
 
     pub async fn data_mode(&self) -> anyhow::Result<()> {
-        let mut mode = self.mode.lock().await;
-        match *mode {
-            Mode::Data => Ok(()),
-            Mode::Command => {
-                let mut pins = self.pins.lock().await;
-                let mut cmd_client = self.cmd_client.lock().await;
-
-                pins.dtr.set_high();
-                cmd_client
-                    .send(&lib::at::general::EnterDataMode)
-                    .await
-                    .map_err(|e| anyhow!("Failed to send ATO command: {:?}", e))?;
-                *mode = Mode::Data;
-                log::info!("Modem entered data mode");
-                Ok(())
-            }
-        }
+        self.mode_result_signal.reset();
+        self.mode_signal.signal(Mode::Data);
+        self.mode_result_signal.wait().await
     }
 
     pub async fn command_mode(&self) -> anyhow::Result<()> {
-        let mut mode = self.mode.lock().await;
-        match *mode {
-            Mode::Command => Ok(()),
-            Mode::Data => {
-                let mut pins = self.pins.lock().await;
-                pins.dtr.set_low();
-                log::info!("Modem entered command mode");
-                *mode = Mode::Command;
-
-                embassy_time::Timer::after_millis(100).await;
-                pins.dtr.set_high();
-
-                Ok(())
-            }
-        }
+        self.mode_result_signal.reset();
+        self.mode_signal.signal(Mode::Command);
+        self.mode_result_signal.wait().await
     }
 
     pub async fn command<Cmd: atat::AtatCmd>(&self, cmd: &Cmd) -> anyhow::Result<Cmd::Response> {
@@ -229,42 +213,53 @@ async fn cmd_ingress_task(
 }
 
 #[task]
-async fn ri_task(mut ri: Input<'static, AnyPin>) {
-    loop {
-        ri.wait_for_any_edge().await;
-        let state = match ri.is_high() {
-            true => "HIGH",
-            false => "LOW",
-        };
-        log::debug!("MODEM RI {}", state);
-    }
-}
-
-#[task]
 async fn io_task(
     mut uart: ModemUart,
-    mode_mutex: Arc<Mutex<CriticalSectionRawMutex, Mode>>,
+    mode_signal: Arc<Signal<CriticalSectionRawMutex, Mode>>,
+    mode_result_signal: Arc<Signal<CriticalSectionRawMutex, anyhow::Result<()>>>,
     cmd_tx_reader: CommandRx,
     mut cmd_rx_writer: CommandTx,
     data_tx_reader: DataRx,
     mut data_rx_writer: DataTx,
+    pins: Arc<Mutex<CriticalSectionRawMutex, Pins>>,
+    mut ri: Input<'static, AnyPin>,
 ) -> ! {
-    use embassy_futures::select::Either;
+    use embassy_futures::select::{Either3, Either4};
     use embedded_io_async::{Read, Write};
+    let mut mode = Mode::Command;
+    let mut ri_triggered_at: Option<Instant> = None;
     loop {
-        let mut mode = mode_mutex.lock().await;
-        match *mode {
+        match mode {
             Mode::Command => {
-                let mut uart_buf: [u8; 64] = [0; 64];
+                if let Some(at) = ri_triggered_at.take() {
+                    if at.elapsed() > Duration::from_secs(5) {
+                        log::debug!("MODEM: ring indicator triggered switch timeout, going back to data mode");
+                        let mut pins = pins.lock().await;
+                        let mut buf = [0; UART_CMD_BUF_SIZE];
+                        if let Err(e) = enter_data_mode(
+                            &mut pins,
+                            &mut uart,
+                            &mut buf,
+                            &mut cmd_rx_writer,
+                            &mut mode,
+                        )
+                        .await
+                        {
+                            log::error!("MODEM: Failed to enter data mode: {:?}", e);
+                        };
+                    }
+                }
+                let mut uart_buf: [u8; UART_CMD_BUF_SIZE] = [0; UART_CMD_BUF_SIZE];
                 let mut cmd_buf: [u8; COMMAND_PIPE_SIZE] = [0; COMMAND_PIPE_SIZE];
-                let result = embassy_futures::select::select(
+                let result = embassy_futures::select::select3(
                     cmd_tx_reader.read(&mut cmd_buf),
                     uart.read(&mut uart_buf),
+                    mode_signal.wait(),
                 )
                 .await;
                 match result {
                     // CMD TX
-                    Either::First(len) => {
+                    Either3::First(len) => {
                         if len == 0 {
                             continue;
                         }
@@ -275,7 +270,7 @@ async fn io_task(
                             .ok();
                     }
                     // UART RX
-                    Either::Second(Ok(len)) => {
+                    Either3::Second(Ok(len)) => {
                         if len == 0 {
                             continue;
                         }
@@ -287,7 +282,7 @@ async fn io_task(
                                 .await
                                 .map_err(|e| log::error!("Pipe write error: {:?}", e))
                                 .ok();
-                            *mode = Mode::Data;
+                            mode = Mode::Data;
                         } else {
                             cmd_rx_writer
                                 .write_all(&uart_buf[..len])
@@ -297,20 +292,39 @@ async fn io_task(
                         }
                     }
                     // UART RX Error
-                    Either::Second(Err(e)) => log::error!("UART read error: {:?}", e),
+                    Either3::Second(Err(e)) => log::error!("UART read error: {:?}", e),
+                    Either3::Third(Mode::Command) => {
+                        mode_signal.reset();
+                        mode_result_signal.signal(Ok(()));
+                    }
+                    Either3::Third(Mode::Data) => {
+                        mode_signal.reset();
+                        let mut pins = pins.lock().await;
+                        let result = enter_data_mode(
+                            &mut pins,
+                            &mut uart,
+                            &mut uart_buf,
+                            &mut cmd_rx_writer,
+                            &mut mode,
+                        )
+                        .await;
+                        mode_result_signal.signal(result);
+                    }
                 }
             }
             Mode::Data => {
-                let mut uart_buf: [u8; 64] = [0; 64];
+                let mut uart_buf: [u8; UART_DATA_BUF_SIZE] = [0; UART_DATA_BUF_SIZE];
                 let mut data_buf: [u8; DATA_PIPE_SIZE] = [0; DATA_PIPE_SIZE];
-                let result = embassy_futures::select::select(
+                let result = embassy_futures::select::select4(
                     data_tx_reader.read(&mut data_buf),
                     uart.read(&mut uart_buf),
+                    mode_signal.wait(),
+                    ri.wait_for_low(),
                 )
                 .await;
                 match result {
                     // DATA TX
-                    Either::First(len) => {
+                    Either4::First(len) => {
                         if len == 0 {
                             continue;
                         }
@@ -321,7 +335,7 @@ async fn io_task(
                             .ok();
                     }
                     // UART RX
-                    Either::Second(Ok(len)) => {
+                    Either4::Second(Ok(len)) => {
                         if len == 0 {
                             continue;
                         }
@@ -332,7 +346,42 @@ async fn io_task(
                             .map_err(|e| log::error!("Pipe write error: {:?}", e))
                             .ok();
                     }
-                    Either::Second(Err(e)) => log::error!("UART read error: {:?}", e),
+                    Either4::Second(Err(e)) => log::error!("UART read error: {:?}", e),
+                    Either4::Third(Mode::Data) => {
+                        mode_signal.reset();
+                        mode_result_signal.signal(Ok(()));
+                    }
+                    Either4::Third(Mode::Command) => {
+                        mode_signal.reset();
+                        let mut pins = pins.lock().await;
+                        let result = enter_command_mode(
+                            &mut pins,
+                            &mut uart,
+                            &mut uart_buf,
+                            &mut data_rx_writer,
+                            &mut mode,
+                        )
+                        .await;
+                        mode_result_signal.signal(result);
+                    }
+                    // RI pin low
+                    Either4::Fourth(_) => {
+                        log::info!("MODEM: ring indicator triggered, entering command mode");
+                        ri_triggered_at = Some(Instant::now());
+                        ri.wait_for_high().await;
+                        let mut pins = pins.lock().await;
+                        if let Err(e) = enter_command_mode(
+                            &mut pins,
+                            &mut uart,
+                            &mut uart_buf,
+                            &mut data_rx_writer,
+                            &mut mode,
+                        )
+                        .await
+                        {
+                            log::error!("Failed to enter command mode: {:?}", e)
+                        };
+                    }
                 }
             }
         }
@@ -341,6 +390,84 @@ async fn io_task(
 
 fn detect_data_mode_switch(buf: &[u8]) -> Option<usize> {
     let string = core::str::from_utf8(buf).ok()?;
-    const CONNECT: &str = "CONNECT\r\n";
     string.find_substring(CONNECT).map(|i| i + CONNECT.len())
+}
+
+fn detect_command_mode_switch(buf: &[u8]) -> Option<usize> {
+    for (i, window) in buf.windows(OK.len()).enumerate() {
+        if window == OK {
+            return Some(i);
+        }
+    }
+    None
+}
+
+async fn enter_command_mode(
+    pins: &mut Pins,
+    uart: &mut ModemUart,
+    uart_buf: &mut [u8],
+    data_rx_writer: &mut DataTx,
+    mode: &mut Mode,
+) -> anyhow::Result<()> {
+    use embedded_io_async::{Read, Write};
+
+    log::debug!("MODEM: Entering command mode...");
+
+    pins.dtr.set_low();
+    embassy_time::Timer::after_millis(1200).await;
+    pins.dtr.set_high();
+
+    let mut attemts_left = 10;
+    while attemts_left > 0 {
+        attemts_left -= 1;
+        uart.read(uart_buf)
+            .await
+            .map_err(|e| anyhow!("UART read error: {:?}", e))?;
+        if let Some(len) = detect_command_mode_switch(uart_buf) {
+            log::info!("Modem entered command mode");
+            *mode = Mode::Command;
+
+            // flush remaining data to consumer, if any
+            data_rx_writer
+                .write_all(&uart_buf[..len])
+                .await
+                .map_err(|e| anyhow!("Pipe write error: {:?}", e))?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Failed to detect command mode switch");
+}
+
+async fn enter_data_mode(
+    pins: &mut Pins,
+    uart: &mut ModemUart,
+    uart_buf: &mut [u8],
+    cmd_rx_writer: &mut CommandTx,
+    mode: &mut Mode,
+) -> anyhow::Result<()> {
+    use embedded_io_async::{Read, Write};
+
+    pins.dtr.set_high();
+    uart.write_all(b"ATO\r\n")
+        .await
+        .map_err(|e| anyhow!("UART write error: {:?}", e))?;
+
+    let mut attempts_left = 10;
+    while attempts_left > 0 {
+        attempts_left -= 1;
+        uart.read(uart_buf)
+            .await
+            .map_err(|e| anyhow!("UART read error: {:?}", e))?;
+        if let Some(len) = detect_data_mode_switch(uart_buf) {
+            log::info!("Modem entered data mode");
+            *mode = Mode::Data;
+            // flush remaining command rx before our ATO command, if any
+            cmd_rx_writer
+                .write_all(&uart_buf[..len - CONNECT.len()])
+                .await
+                .map_err(|e| anyhow!("Pipe write error: {:?}", e))?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Failed to detect data mode switch");
 }

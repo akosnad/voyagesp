@@ -30,7 +30,7 @@ ublox = { version = "0.4.5", default-features = false, features = ["alloc", "ser
 serde = { version = "1.0.210", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
 anyhow = { version = "1.0.89", default-features = false }
-embassy-executor = { version = "0.6.0", features = ["executor-thread", "integrated-timers", "task-arena-size-20480"] }
+embassy-executor = { version = "0.6.0", features = ["executor-thread", "integrated-timers", "nightly"] }
 embassy-time = { version = "0.3.2" }
 esp-hal-embassy = { version = "0.4.0", features = ["esp32", "log"] }
 embassy-net = { version = "0.4.0", features = ["dhcpv4", "dhcpv4-hostname", "dns", "log", "medium-ip", "proto-ipv4", "tcp", "udp"] }
