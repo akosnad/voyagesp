@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 #[derive(serde::Deserialize)]
 struct Config {
+    powersave_delay_seconds: usize,
     wifi_ssid: String,
     wifi_password: String,
     mqtt_user: String,
@@ -39,6 +40,10 @@ impl Config {
     }
 
     fn export_vars(&self) {
+        println!(
+            "cargo:rustc-env=POWERSAVE_DELAY_SECONDS={}",
+            self.powersave_delay_seconds
+        );
         println!("cargo:rustc-env=WIFI_SSID={}", self.wifi_ssid);
         println!("cargo:rustc-env=WIFI_PASSWORD={}", self.wifi_password);
         println!("cargo:rustc-env=MQTT_USER={}", self.mqtt_user);

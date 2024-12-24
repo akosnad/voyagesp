@@ -8,7 +8,7 @@ use static_cell::make_static;
 use super::*;
 
 pub const INGRESS_BUF_SIZE: usize = 64;
-pub const URC_CAPACITY: usize = 8;
+pub const URC_CAPACITY: usize = 32;
 pub const URC_SUBSCRIBERS: usize = 3;
 const COMMAND_PIPE_SIZE: usize = 128;
 const DATA_PIPE_SIZE: usize = 2048;
@@ -34,6 +34,7 @@ const OK: &[u8] = b"OK\r\n";
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 enum Mode {
     #[default]
+    PoweredDown,
     Command,
     Data,
 }
@@ -156,6 +157,10 @@ impl ModemInterface {
         info!("Modem powered on, initializing...");
         Timer::after(Duration::from_millis(5_000)).await;
 
+        self.mode_result_signal.reset();
+        self.mode_signal.signal(Mode::Command);
+        self.mode_result_signal.wait().await?;
+
         cmd_client
             .send(&lib::at::AT)
             .await
@@ -172,6 +177,24 @@ impl ModemInterface {
             .map_err(|e| anyhow::anyhow!("Failed to set DTR handling: {:?}", e))?;
 
         info!("Modem hardware initialized");
+        Ok(())
+    }
+
+    pub async fn power_down(&self) -> anyhow::Result<()> {
+        log::info!("Powering down modem...");
+        // intentionally take command client to block others
+        let _cmd_client = self.cmd_client.lock().await;
+        self.command_mode().await?;
+
+        self.mode_result_signal.reset();
+        self.mode_signal.signal(Mode::PoweredDown);
+        self.mode_result_signal.wait().await?;
+
+        let mut pins = self.pins.lock().await;
+        pins.power_on.set_low();
+        pins.pwrkey.set_low();
+
+        log::info!("Modem powered down");
         Ok(())
     }
 
@@ -216,9 +239,9 @@ async fn io_task(
     mut uart: ModemUart,
     mode_signal: Arc<Signal<CriticalSectionRawMutex, Mode>>,
     mode_result_signal: Arc<Signal<CriticalSectionRawMutex, anyhow::Result<()>>>,
-    cmd_tx_reader: CommandRx,
+    mut cmd_tx_reader: CommandRx,
     mut cmd_rx_writer: CommandTx,
-    data_tx_reader: DataRx,
+    mut data_tx_reader: DataRx,
     mut data_rx_writer: DataTx,
     pins: Arc<Mutex<CriticalSectionRawMutex, Pins>>,
     mut ri: Input<'static, AnyPin>,
@@ -291,6 +314,17 @@ async fn io_task(
                         .await;
                         mode_result_signal.signal(result);
                     }
+                    Either3::Third(Mode::PoweredDown) => {
+                        mode_signal.reset();
+                        embedded_io_async::Write::flush(&mut cmd_rx_writer)
+                            .await
+                            .ok();
+                        embedded_io_async::Write::flush(&mut data_rx_writer)
+                            .await
+                            .ok();
+                        embedded_io_async::Write::flush(&mut uart).await.ok();
+                        mode_result_signal.signal(Ok(()));
+                    }
                 }
             }
             Mode::Data => {
@@ -346,6 +380,18 @@ async fn io_task(
                         .await;
                         mode_result_signal.signal(result);
                     }
+                    Either4::Third(Mode::PoweredDown) => {
+                        mode_signal.reset();
+                        embedded_io_async::Write::flush(&mut cmd_rx_writer)
+                            .await
+                            .ok();
+                        embedded_io_async::Write::flush(&mut data_rx_writer)
+                            .await
+                            .ok();
+                        embedded_io_async::Write::flush(&mut uart).await.ok();
+                        data_rx_writer.write_all(b"\0").await.ok();
+                        mode_result_signal.signal(Ok(()));
+                    }
                     // RI pin low
                     Either4::Fourth(_) => {
                         log::info!("MODEM: ring indicator triggered, entering command mode");
@@ -365,6 +411,28 @@ async fn io_task(
                         };
                     }
                 }
+            }
+            Mode::PoweredDown => {
+                match mode_signal
+                    .wait()
+                    .with_timeout(Duration::from_secs(1))
+                    .await
+                {
+                    Ok(Mode::Command) => mode = Mode::Command,
+                    Ok(Mode::Data) => {
+                        mode_result_signal.signal(Err(anyhow::anyhow!(
+                            "Can't enter data mode immediately after power down"
+                        )));
+                        mode_result_signal.signal(Ok(()));
+                        continue;
+                    }
+                    Ok(Mode::PoweredDown) => {}
+                    Err(TimeoutError) => {}
+                }
+                // flush data from buffers, so we don't try to parse it after power up
+                cmd_tx_reader.consume(UART_CMD_BUF_SIZE);
+                data_tx_reader.consume(UART_DATA_BUF_SIZE);
+                mode_signal.reset();
             }
         }
     }
@@ -403,7 +471,8 @@ async fn enter_command_mode(
     let mut attemts_left = 10;
     while attemts_left > 0 {
         attemts_left -= 1;
-        let len = uart.read(uart_buf)
+        let len = uart
+            .read(uart_buf)
             .await
             .map_err(|e| anyhow!("UART read error: {:?}", e))?;
         if let Some(data_len) = detect_command_mode_switch(&uart_buf[..len]) {
@@ -446,7 +515,8 @@ async fn enter_data_mode(
     let mut attempts_left = 10;
     while attempts_left > 0 {
         attempts_left -= 1;
-        let len = uart.read(uart_buf)
+        let len = uart
+            .read(uart_buf)
             .await
             .map_err(|e| anyhow!("UART read error: {:?}", e))?;
         if let Some(cmd_len) = detect_data_mode_switch(&uart_buf[..len]) {

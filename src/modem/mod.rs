@@ -2,10 +2,13 @@ use alloc::sync::Arc;
 use anyhow::anyhow;
 use core::str::FromStr;
 use embassy_executor::task;
+use embassy_futures::select::{select, Either};
 use embassy_net::{Ipv4Address, StaticConfigV4};
+use embassy_sync::pubsub::WaitResult;
+use embassy_sync::signal::Signal;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_time::WithTimeout as _;
 use embassy_time::{Duration, Timer};
+use embassy_time::{TimeoutError, WithTimeout as _};
 use esp_hal::{
     gpio::{AnyPin, Input, Output},
     peripherals::UART2,
@@ -26,6 +29,7 @@ use interface::ModemInterface;
 #[derive(Debug, Clone, Default, PartialEq)]
 enum ModemState {
     #[default]
+    PoweredDown,
     Uninitialized,
     Initializing,
     HardwareReady,
@@ -33,11 +37,13 @@ enum ModemState {
     SimOnline,
     GprsOnline,
     PPPFailed,
+    PoweringDown,
 }
 
 pub struct Modem {
     interface: Arc<Mutex<CriticalSectionRawMutex, ModemInterface>>,
     state: Arc<Mutex<CriticalSectionRawMutex, ModemState>>,
+    ppp_drop_signal: Arc<Signal<CriticalSectionRawMutex, ()>>,
 }
 
 impl Modem {
@@ -61,6 +67,7 @@ impl Modem {
 
         let ppp_state = make_static!(embassy_net_ppp::State::new());
         let (ppp_device, ppp_runner) = embassy_net_ppp::new::<16, 16>(ppp_state);
+        let ppp_drop_signal = Arc::new(Signal::new());
 
         spawner
             .spawn(ppp_task(
@@ -69,6 +76,7 @@ impl Modem {
                 ppp_runner,
                 config_sender,
                 state.clone(),
+                ppp_drop_signal.clone(),
             ))
             .map_err(|e| anyhow!("Failed to spawn PPP task: {:?}", e))?;
 
@@ -76,9 +84,27 @@ impl Modem {
             Self {
                 interface: Arc::new(Mutex::new(interface)),
                 state,
+                ppp_drop_signal,
             },
             ppp_device,
         ))
+    }
+
+    pub async fn power_down(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        *state = ModemState::PoweringDown;
+        Ok(())
+    }
+
+    pub async fn power_up(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        *state = ModemState::Uninitialized;
+        Ok(())
+    }
+
+    pub async fn is_powered_up(&self) -> bool {
+        let state = self.state.lock().await;
+        !matches!(*state, ModemState::PoweredDown)
     }
 
     /// Modem stack task
@@ -92,35 +118,48 @@ impl Modem {
             .expect("Failed to subscribe to URC channel");
 
         {
-            let mut state = self.state.lock().await;
-            match *state {
-                ModemState::Uninitialized => {
-                    let interface = self.interface.lock().await;
+            let state = self.state.lock().await;
+            if *state != ModemState::default() {
+                panic!("Modem task already running");
+            }
+        }
+        'main: loop {
+            {
+                let mut state = self.state.lock().await;
+                if *state == ModemState::Uninitialized {
+                    let mut interface = self.interface.lock().await;
                     *state = ModemState::Initializing;
                     while let Err(e) = interface.init_hardware().await {
                         log::error!("Failed to initialize modem: {:?}", e);
                     }
                     *state = ModemState::HardwareReady;
+                    self.dump_info(&mut interface)
+                        .await
+                        .map_err(|e| log::error!("Failed to dump info: {:?}", e))
+                        .ok();
                 }
-                _ => panic!("Modem task already running"),
             }
-        }
-        let mut int = self.interface.lock().await;
+            let mut int = self.interface.lock().await;
 
-        self.dump_info(&mut int)
-            .await
-            .map_err(|e| log::error!("Failed to dump info: {:?}", e))
-            .ok();
+            if *self.state.lock().await == ModemState::PoweredDown {
+                Timer::after(Duration::from_secs(5)).await;
+                continue 'main;
+            }
 
-        'main: loop {
             let future = urc_subcriber
                 .next_message()
-                .with_timeout(Duration::from_secs(3));
-            if let Ok(embassy_sync::pubsub::WaitResult::Message(urc)) = future.await {
-                self.handle_urc(&mut int, urc)
-                    .await
-                    .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
-                    .ok();
+                .with_timeout(Duration::from_millis(250));
+            match future.await {
+                Ok(WaitResult::Message(urc)) => {
+                    self.handle_urc(&mut int, urc)
+                        .await
+                        .map_err(|e| log::error!("Failed to handle URC: {:?}", e))
+                        .ok();
+                }
+                Ok(WaitResult::Lagged(n)) => {
+                    log::warn!("MODEM: Missed {} URCs", n);
+                }
+                Err(TimeoutError) => {}
             }
 
             {
@@ -236,6 +275,11 @@ impl Modem {
                 }
                 Ok(ModemState::SimOnline)
             }
+            ModemState::PoweringDown => {
+                int.power_down().await?;
+                self.ppp_drop_signal.signal(());
+                Ok(ModemState::PoweredDown)
+            }
             _ => Ok(current_state),
         }
     }
@@ -269,6 +313,7 @@ async fn ppp_task(
         1,
     >,
     modem_state: Arc<Mutex<CriticalSectionRawMutex, ModemState>>,
+    drop_signal: Arc<Signal<CriticalSectionRawMutex, ()>>,
 ) {
     let on_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
         let Some(address) = ipv4_status.address else {
@@ -313,14 +358,19 @@ async fn ppp_task(
             username: b"",
             password: b"",
         };
-        if let Err(e) = runner.run(rw, config, on_ipv4_up).await {
-            log::error!("PPP link exited with error: {:?}", e);
-            let mut state = modem_state.lock().await;
-            if *state == ModemState::GprsOnline {
-                *state = ModemState::PPPFailed;
+        drop_signal.reset();
+        match select(runner.run(rw, config, on_ipv4_up), drop_signal.wait()).await {
+            Either::First(Err(e)) => {
+                log::error!("PPP link exited with error: {:?}", e);
+                let mut state = modem_state.lock().await;
+                if *state == ModemState::GprsOnline {
+                    *state = ModemState::PPPFailed;
+                }
+                embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
             }
+            Either::First(Ok(_)) => {}
+            Either::Second(_) => {}
         }
-        embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
     }
 }
 

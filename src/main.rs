@@ -3,13 +3,15 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 #![feature(impl_trait_in_assoc_type)]
+#![feature(const_int_from_str)]
 
 use alloc::{boxed::Box, sync::Arc};
 use core::{str::FromStr, sync::atomic::AtomicBool};
 use embassy_executor::{task, Spawner};
+use embassy_futures::yield_now;
 use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     gpio::{Input, Io, Output},
@@ -41,6 +43,12 @@ const HEAP_SIZE: usize = 64 * 1024;
 const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
 const GPS_DATA_INTERVAL: Duration = Duration::from_secs(5);
 const IGNITION_SENSE_DEBOUNCE: Duration = Duration::from_secs(1);
+const POWERSAVE_DELAY: Duration = Duration::from_secs(
+    match u64::from_str_radix(env!("POWERSAVE_DELAY_SECONDS"), 10) {
+        Ok(d) => d,
+        Err(_) => panic!("Invalid POWERSAVE_DELAY_SECONDS"),
+    },
+);
 
 type SystemEventSender = embassy_sync::channel::Sender<
     'static,
@@ -246,13 +254,17 @@ async fn main_task(spawner: Spawner) {
         u64::from_le_bytes(buf)
     };
 
-    let dummy_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: embassy_net::Ipv4Cidr::new(Ipv4Address::new(0, 0, 0, 0), 0),
-        gateway: Some(Ipv4Address::new(0, 0, 0, 0)),
-        dns_servers: heapless::Vec::new(),
-    });
     let modem_stack = {
+        // this is a hack around the non-exhaustive struct `embassy_net::Config`
+        let dummy_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+            address: embassy_net::Ipv4Cidr::new(Ipv4Address::new(0, 0, 0, 0), 0),
+            gateway: Some(Ipv4Address::new(0, 0, 0, 0)),
+            dns_servers: heapless::Vec::new(),
+        });
         let stack = embassy_net::Stack::new(modem_ppp, dummy_config, stack_resources, seed);
+        // here we set the actual config; this is the only way without violating the non-exhaustive
+        // initialization of `embassy_net::Config`
+        stack.set_config_v4(ConfigV4::None);
         let boxed = Box::new(stack);
         Box::leak(boxed)
     };
@@ -281,12 +293,15 @@ async fn main_task(spawner: Spawner) {
         .spawn(gps_data_fetcher(
             gps,
             event_channel.sender(),
-            ignition_state,
+            ignition_state.clone(),
         ))
         .expect("Failed to spawn GPS data fetcher");
     spawner
         .spawn(psu_state_task(psu, event_channel.sender()))
         .expect("Failed to spawn PSU task");
+    spawner
+        .spawn(modem_power_task(modem, ignition_state, modem_stack))
+        .expect("Failed to spawn modem power task");
 }
 
 #[task]
@@ -302,8 +317,6 @@ async fn gps_data_fetcher(
             } else {
                 log::warn!("Tried to get GPS data before initialization");
             }
-        } else {
-            log::debug!("GPS data fetcher: Ignition off, skipping GPS data fetch");
         }
         Timer::after(GPS_DATA_INTERVAL).await;
     }
@@ -421,13 +434,9 @@ async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
             log::info!("Started WiFi");
         }
 
-        log::info!("Connecting to WiFi...");
         match controller.connect().await {
             Ok(_) => log::info!("Wifi connected"),
-            Err(e) => {
-                log::warn!("Failed to connect to WiFi: {:?}", e);
-                Timer::after(Duration::from_millis(5000)).await
-            }
+            Err(_) => Timer::after(Duration::from_millis(5000)).await,
         }
     }
 }
@@ -450,4 +459,40 @@ async fn modem_task(modem: &'static modem::Modem) {
 #[task]
 async fn mqtt_task(mqtt: &'static mqtt::Mqtt) {
     mqtt.run().await;
+}
+
+#[task]
+async fn modem_power_task(
+    modem: &'static modem::Modem,
+    ignition_state: Arc<AtomicBool>,
+    modem_stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
+) {
+    let mut ignition_off_start: Option<Instant> = None;
+    loop {
+        if ignition_state.load(core::sync::atomic::Ordering::SeqCst) {
+            ignition_off_start = None;
+            if !modem.is_powered_up().await {
+                if let Err(e) = modem.power_up().await {
+                    log::error!("Failed to power up modem: {:?}", e);
+                }
+            }
+        } else {
+            match ignition_off_start {
+                Some(ignition_off_start) => {
+                    if ignition_off_start.elapsed() > POWERSAVE_DELAY && modem.is_powered_up().await
+                    {
+                        if modem_stack.config_v4().is_some() {
+                            modem_stack.set_config_v4(ConfigV4::None);
+                        }
+                        if let Err(e) = modem.power_down().await {
+                            log::error!("Failed to power down modem: {:?}", e);
+                        }
+                    }
+                }
+                None => ignition_off_start = Some(Instant::now()),
+            }
+        }
+        // FIXME: this is a busy loop, the nice soulution would be to poll ignition state with futures
+        yield_now().await;
+    }
 }

@@ -2,7 +2,7 @@ use alloc::borrow::ToOwned;
 use alloc::format;
 use anyhow::anyhow;
 use core::str::FromStr;
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_net::{driver::Driver, tcp::TcpSocket, Ipv4Address, Stack};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, once_lock::OnceLock,
@@ -200,31 +200,41 @@ impl Mqtt {
     ) -> anyhow::Result<Connection<'a>> {
         let port = u16::from_str(env!("MQTT_PORT")).expect("invalid MQTT port");
 
-        if self.wifi_stack.is_link_up() && self.wifi_stack.is_config_up() {
-            let ip = Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
-                .expect("invalid IP address for MQTT WiFi endpoint");
+        match select(
+            self.wifi_stack.wait_config_up(),
+            self.modem_stack.wait_config_up(),
+        )
+        .await
+        {
+            // WiFi
+            Either::First(_) => {
+                let ip = Ipv4Address::from_str(env!("MQTT_WIFI_IP"))
+                    .expect("invalid IP address for MQTT WiFi endpoint");
 
-            log::debug!("Using MQTT endpoint: {ip}:{port}");
+                log::debug!("MQTT: Using endpoint: {ip}:{port}");
 
-            Ok(Connection {
-                socket: TcpSocket::new(self.wifi_stack, rx, tx),
-                endpoint: (ip, port),
-                is_wifi: true,
-            })
-        } else if self.modem_stack.is_link_up() && self.modem_stack.is_config_up() {
-            let ip = match get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await {
-                Ok(ip) => ip,
-                Err(e) => anyhow::bail!("Failed to get IP address for MQTT modem endpoint: {e:?}"),
-            };
-            log::debug!("Using MQTT endpoint: {ip}:{port}");
+                Ok(Connection {
+                    socket: TcpSocket::new(self.wifi_stack, rx, tx),
+                    endpoint: (ip, port),
+                    is_wifi: true,
+                })
+            }
+            // Modem
+            Either::Second(_) => {
+                let ip = match get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        anyhow::bail!("Failed to get IP address for MQTT modem endpoint: {e:?}")
+                    }
+                };
+                log::debug!("MQTT: Using endpoint: {ip}:{port}");
 
-            Ok(Connection {
-                socket: TcpSocket::new(self.modem_stack, rx, tx),
-                endpoint: (ip, port),
-                is_wifi: false,
-            })
-        } else {
-            anyhow::bail!("No network connection available");
+                Ok(Connection {
+                    socket: TcpSocket::new(self.modem_stack, rx, tx),
+                    endpoint: (ip, port),
+                    is_wifi: false,
+                })
+            }
         }
     }
 
@@ -267,7 +277,7 @@ impl Mqtt {
                 }
             }
             log::info!(
-                "MQTT socket connected up over {}",
+                "MQTT socket connected over {}",
                 if connection_is_wifi { "WiFi" } else { "modem" }
             );
 

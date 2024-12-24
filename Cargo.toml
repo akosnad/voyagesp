@@ -22,7 +22,7 @@ esp-println = { version = "0.11.0", features = ["esp32", "log"] }
 log = { version = "0.4.21" }
 esp-alloc = { version = "0.5.0" }
 embedded-io = "0.6.1"
-esp-wifi = { version = "0.10.1", features = ["esp32", "embassy-net", "wifi", "tcp", "udp", "esp-alloc", "log", "ipv4", "icmp", "phy-enable-usb"] }
+esp-wifi = { version = "0.10.1", features = ["esp32", "embassy-net", "wifi", "tcp", "udp", "esp-alloc", "ipv4", "icmp", "phy-enable-usb"] }
 heapless = { version = "0.8.0", default-features = false }
 smoltcp = { version = "0.11.0", default-features = false, features = ["dns-max-server-count-2", "medium-ethernet", "proto-dhcpv4", "proto-dns", "proto-igmp", "proto-ipv4", "socket-dhcpv4", "socket-icmp", "socket-raw", "socket-tcp", "socket-udp"] }
 axp192 = "0.2.0"

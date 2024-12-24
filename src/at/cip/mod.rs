@@ -18,7 +18,7 @@ pub struct SetPDPContext {
 }
 
 #[derive(Clone, Debug, AtatCmd)]
-#[at_cmd("+CGATT", EmptyResponse)]
+#[at_cmd("+CGATT", EmptyResponse, timeout_ms = 10000)]
 pub struct AttachToGprsService {
     /// 0 - Detach, 1 - Attach
     pub attach: u8,
