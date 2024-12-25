@@ -30,12 +30,8 @@ impl Config {
         assert!(self.mqtt_port < 65536, "mqtt_port is invalid");
         std::net::Ipv4Addr::from_str(&self.mqtt_wifi_ip).expect("mqtt_wifi_ip is invalid");
         assert!(
-            !self.device_tracker_config.availability.is_empty(),
-            "device_tracker_config.availability should contain at least one element"
-        );
-        assert!(
             !self.ignition_sense_sensor_config.availability.is_empty(),
-            "device_tracker_config.availability should contain at least one element"
+            "ignition_sense_sensor_config.availability should contain at least one element"
         );
     }
 

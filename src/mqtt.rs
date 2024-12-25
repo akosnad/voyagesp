@@ -59,8 +59,8 @@ impl DiagnosticEntities {
         DIAGNOSTIC_ENTITIES.get_or_init(|| {
             const TOPIC_PREFIX: &str = env!("DIAGNOSTIC_ENTITIES_TOPIC_PREFIX");
             let config = &crate::config::SystemConfig::get();
-            let availability = config.device_tracker.availability.to_owned();
-            let device = config.device_tracker.device.clone();
+            let availability = config.ignition_sense_sensor.availability.to_owned();
+            let device = config.ignition_sense_sensor.device.clone();
 
             let gen_sensor = |name: &'static str,
                               display_name: &'static str,
@@ -175,7 +175,12 @@ impl Mqtt {
         config.add_client_id(&system_config.device_tracker.unique_id.0);
         config.add_username(env!("MQTT_USER"));
         config.add_password(env!("MQTT_PASSWORD"));
-        if let Some(availability) = system_config.device_tracker.availability.first() {
+        if let Some(availability) = system_config
+            .ignition_sense_sensor
+            .availability
+            .first()
+            .or(system_config.device_tracker.availability.first())
+        {
             let payload_offline = availability
                 .payload_not_available
                 .as_deref()
@@ -368,7 +373,11 @@ impl Mqtt {
         } = &crate::config::SystemConfig::get();
 
         // send birth message
-        if let Some(device_tracker_availability) = device_tracker.availability.first() {
+        if let Some(device_tracker_availability) = ignition_sense_sensor
+            .availability
+            .first()
+            .or(device_tracker.availability.first())
+        {
             let online = device_tracker_availability
                 .payload_available
                 .as_deref()
