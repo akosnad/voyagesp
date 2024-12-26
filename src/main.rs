@@ -5,7 +5,7 @@
 #![feature(impl_trait_in_assoc_type)]
 #![feature(const_int_from_str)]
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::sync::Arc;
 use core::{str::FromStr, sync::atomic::AtomicBool};
 use embassy_executor::{task, Spawner};
 use embassy_futures::yield_now;
@@ -26,6 +26,7 @@ use esp_wifi::wifi::{
 };
 use mqtt::PublishEvent;
 use static_cell::make_static;
+pub use voyagesp as lib;
 
 extern crate alloc;
 
@@ -110,8 +111,7 @@ async fn main_task(spawner: Spawner) {
             SystemEvent,
             SYSTEM_EVENT_QUEUE_SIZE,
         > = embassy_sync::channel::Channel::new();
-        let boxed = Box::new(chan);
-        Box::leak(boxed)
+        make_static!(chan)
     };
 
     let ignition_state = Arc::new(AtomicBool::new(false));
@@ -156,7 +156,7 @@ async fn main_task(spawner: Spawner) {
     )
     .expect("Failed to create WiFi network interface");
 
-    let stack_resources: &mut StackResources<3> = Box::leak(Box::new(StackResources::new()));
+    let stack_resources: &'static mut StackResources<3> = make_static!(StackResources::new());
     let wifi_stack = make_static!(embassy_net::Stack::new(
         wifi_device,
         embassy_net::Config::dhcpv4(Default::default()),
@@ -222,8 +222,7 @@ async fn main_task(spawner: Spawner) {
     let config_chan = {
         let chan: embassy_sync::channel::Channel<CriticalSectionRawMutex, StaticConfigV4, 1> =
             embassy_sync::channel::Channel::new();
-        let boxed = Box::new(chan);
-        Box::leak(boxed)
+        make_static!(chan)
     };
     let (modem, modem_ppp) = {
         let modem = modem::Modem::new(
@@ -245,8 +244,7 @@ async fn main_task(spawner: Spawner) {
 
     let stack_resources = {
         let resources: StackResources<3> = StackResources::new();
-        let boxed = Box::new(resources);
-        Box::leak(boxed)
+        make_static!(resources)
     };
     let seed = {
         let mut buf = [0u8; 8];
@@ -265,8 +263,8 @@ async fn main_task(spawner: Spawner) {
         // here we set the actual config; this is the only way without violating the non-exhaustive
         // initialization of `embassy_net::Config`
         stack.set_config_v4(ConfigV4::None);
-        let boxed = Box::new(stack);
-        Box::leak(boxed)
+
+        make_static!(stack)
     };
 
     spawner

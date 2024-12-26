@@ -1,3 +1,4 @@
+use super::lib;
 use alloc::sync::Arc;
 use anyhow::anyhow;
 use core::str::FromStr;
@@ -17,8 +18,6 @@ use esp_hal::{
 };
 use log::info;
 use static_cell::{make_static, StaticCell};
-
-use voyagesp as lib;
 
 use lib::at::{general::urc::PinStatus, Urc};
 
