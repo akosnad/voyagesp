@@ -313,7 +313,7 @@ async fn ppp_task(
     >,
     modem_state: Arc<Mutex<CriticalSectionRawMutex, ModemState>>,
     drop_signal: Arc<Signal<CriticalSectionRawMutex, ()>>,
-) {
+) -> ! {
     let on_ipv4_up = |ipv4_status: embassy_net_ppp::Ipv4Status| {
         let Some(address) = ipv4_status.address else {
             log::warn!("No address set in ipv4 modem PPP status");
@@ -365,7 +365,6 @@ async fn ppp_task(
                 if *state == ModemState::GprsOnline {
                     *state = ModemState::PPPFailed;
                 }
-                embassy_time::Timer::after(embassy_time::Duration::from_secs(1)).await;
             }
             Either::First(Ok(_)) => {}
             Either::Second(_) => {}

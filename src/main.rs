@@ -39,7 +39,7 @@ const GPS_BAUD: u32 = 9600;
 const MODEM_BAUD: u32 = 115_200;
 
 const SYSTEM_EVENT_QUEUE_SIZE: usize = 5;
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 56 * 1024;
 
 const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
 const GPS_DATA_INTERVAL: Duration = Duration::from_secs(5);
