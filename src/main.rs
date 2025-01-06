@@ -42,6 +42,7 @@ const SYSTEM_EVENT_QUEUE_SIZE: usize = 5;
 const HEAP_SIZE: usize = 56 * 1024;
 
 const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
+const PSU_DATA_IDLE_INTERVAL: Duration = Duration::from_secs(120);
 const GPS_DATA_INTERVAL: Duration = Duration::from_secs(5);
 const IGNITION_SENSE_DEBOUNCE: Duration = Duration::from_secs(1);
 const POWERSAVE_DELAY: Duration = Duration::from_secs(
@@ -295,7 +296,11 @@ async fn main_task(spawner: Spawner) {
         ))
         .expect("Failed to spawn GPS data fetcher");
     spawner
-        .spawn(psu_state_task(psu, event_channel.sender()))
+        .spawn(psu_state_task(
+            psu,
+            event_channel.sender(),
+            ignition_state.clone(),
+        ))
         .expect("Failed to spawn PSU task");
     spawner
         .spawn(modem_power_task(modem, ignition_state, modem_stack))
@@ -320,20 +325,44 @@ async fn gps_data_fetcher(
     }
 }
 
-#[task]
-async fn psu_state_task(psu: &'static mut Psu, event_sender: SystemEventSender) -> ! {
-    loop {
-        let data = PsuData {
-            battery_charging: psu.get_charging().unwrap(),
-            battery_voltage: psu.get_battery_voltage().unwrap(),
-            battery_charge_current: psu.get_battery_charge_current().unwrap(),
-            ext_voltage: psu.get_acin_voltage().unwrap(),
-            ext_current: psu.get_acin_current().unwrap(),
-            temperature: psu.get_internal_temperature().unwrap(),
-        };
-        event_sender.send(SystemEvent::PsuData(data)).await;
+fn get_psu_data(psu: &mut Psu) -> anyhow::Result<PsuData> {
+    Ok(PsuData {
+        battery_charging: psu.get_charging().map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        battery_voltage: psu
+            .get_battery_voltage()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        battery_charge_current: psu
+            .get_battery_charge_current()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        ext_voltage: psu
+            .get_acin_voltage()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        ext_current: psu
+            .get_acin_current()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        temperature: psu
+            .get_internal_temperature()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+    })
+}
 
-        Timer::after(PSU_DATA_INTERVAL).await;
+#[task]
+async fn psu_state_task(
+    psu: &'static mut Psu,
+    event_sender: SystemEventSender,
+    ignition_state: Arc<AtomicBool>,
+) -> ! {
+    loop {
+        match get_psu_data(psu) {
+            Ok(data) => event_sender.send(SystemEvent::PsuData(data)).await,
+            Err(e) => log::error!("Failed to get PSU data: {:?}", e),
+        };
+
+        if ignition_state.load(core::sync::atomic::Ordering::SeqCst) {
+            Timer::after(PSU_DATA_INTERVAL).await;
+        } else {
+            Timer::after(PSU_DATA_IDLE_INTERVAL).await;
+        }
     }
 }
 
