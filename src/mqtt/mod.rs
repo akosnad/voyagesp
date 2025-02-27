@@ -1,4 +1,5 @@
 use super::lib;
+use alloc::format;
 use anyhow::anyhow;
 use core::str::FromStr;
 use embassy_futures::select::{select, select3, Either, Either3};
@@ -75,6 +76,38 @@ impl PublishEvent {
     }
 }
 
+#[derive(Debug)]
+enum RemoteAction {
+    Reboot,
+}
+
+impl TryFrom<(&str, &[u8])> for RemoteAction {
+    type Error = ();
+    fn try_from((topic, _payload): (&str, &[u8])) -> Result<Self, ()> {
+        const TOPIC_PREFIX: &str = env!("DIAGNOSTIC_ENTITIES_TOPIC_PREFIX");
+        let inner_topic = topic
+            .strip_prefix(format!("{TOPIC_PREFIX}/").as_str())
+            .ok_or(())?;
+
+        match inner_topic {
+            "reboot" => Ok(RemoteAction::Reboot),
+            _ => Err(()),
+        }
+    }
+}
+
+impl RemoteAction {
+    async fn handle(self) -> anyhow::Result<()> {
+        log::debug!("Handling remote action: {:?}", self);
+        match self {
+            RemoteAction::Reboot => {
+                esp_hal::reset::software_reset();
+                unreachable!();
+            }
+        }
+    }
+}
+
 struct Client<'c, 's> {
     inner: ClientInner<'c, 's>,
 }
@@ -93,7 +126,7 @@ impl<'c, 'sb, 's> Client<'c, 's> {
         self.inner.send_ping().await
     }
 
-    async fn init_entities(&mut self) -> anyhow::Result<()> {
+    async fn init_entities(&mut self, allow_actions: bool) -> anyhow::Result<()> {
         self.send_birth_message().await?;
 
         let crate::config::SystemConfig {
@@ -104,9 +137,11 @@ impl<'c, 'sb, 's> Client<'c, 's> {
         self.send_discovery_config(device_tracker).await?;
         self.send_discovery_config(ignition_sense_sensor).await?;
 
-        DiagnosticEntities::get()
-            .send_discovery_configs(self)
-            .await?;
+        let diagnostic_entities = DiagnosticEntities::get();
+        diagnostic_entities.send_discovery_configs(self).await?;
+        if allow_actions {
+            diagnostic_entities.subscribe_to_actions(self).await?;
+        }
         Ok(())
     }
 
@@ -167,6 +202,13 @@ impl<'c, 'sb, 's> Client<'c, 's> {
             .map_err(|e| anyhow!("Failed to send MQTT message: {e:?}"))?;
 
         Ok(())
+    }
+
+    async fn subscribe_to_topic(&mut self, topic: &str) -> anyhow::Result<()> {
+        self.inner
+            .subscribe_to_topic(topic)
+            .await
+            .map_err(|e| anyhow!("Failed to subscribe to topic {topic}: {e:?}"))
     }
 
     async fn handle_psu_event(&mut self, psu_state: PsuData) -> anyhow::Result<()> {
@@ -416,7 +458,8 @@ impl Mqtt {
         client: &mut Client<'_, '_>,
         connection_medium: ConnectionMedium,
     ) -> anyhow::Result<()> {
-        client.init_entities().await?;
+        let allow_actions = matches!(connection_medium, ConnectionMedium::Wifi);
+        client.init_entities(allow_actions).await?;
         log::info!("MQTT: entities initialized");
 
         loop {
@@ -431,8 +474,14 @@ impl Mqtt {
                         .await
                         .map_err(|e| anyhow!("Failed to handle event: {e:?}"))?;
                 }
-                Either3::Second(Ok((topic, _payload))) => {
+                Either3::Second(Ok((topic, payload))) => {
                     log::info!("MQTT: Received message on topic: {}", topic);
+                    if let Ok(action) = RemoteAction::try_from((topic, payload)) {
+                        action
+                            .handle()
+                            .await
+                            .map_err(|e| anyhow!("Failed to handle remote event: {e:?}"))?;
+                    }
                 }
                 Either3::Second(Err(e)) => {
                     anyhow::bail!("Failed to receive message: {:?}", e);

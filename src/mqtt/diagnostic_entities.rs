@@ -1,6 +1,6 @@
 use alloc::{borrow::ToOwned as _, format};
 use embassy_sync::once_lock::OnceLock;
-use hass_types::{BinarySensor, Sensor, Topic};
+use hass_types::{BinarySensor, Button, Sensor, Topic};
 
 use super::Client;
 
@@ -13,6 +13,7 @@ pub struct DiagnosticEntities {
     pub ext_current: Sensor,
     pub int_temperature: Sensor,
     pub satellite_count: Sensor,
+    pub reboot_button: Button,
 }
 impl DiagnosticEntities {
     pub fn get() -> &'static Self {
@@ -114,6 +115,16 @@ impl DiagnosticEntities {
                     Some(0),
                     None,
                 ),
+                reboot_button: Button {
+                    availability: availability.clone(),
+                    device: device.clone(),
+                    unique_id: hass_types::UniqueId(format!("{}_{}", TOPIC_PREFIX, "reboot")),
+                    name: "Reboot software".into(),
+                    device_class: Some(hass_types::ButtonDeviceClass::restart),
+                    command_topic: Topic(format!("{}/{}", TOPIC_PREFIX, "reboot")),
+                    entity_category: Some(hass_types::EntityCategory::diagnostic),
+                    ..Default::default()
+                },
             }
         })
     }
@@ -129,6 +140,14 @@ impl DiagnosticEntities {
         client.send_discovery_config(&self.ext_current).await?;
         client.send_discovery_config(&self.int_temperature).await?;
         client.send_discovery_config(&self.satellite_count).await?;
+        client.send_discovery_config(&self.reboot_button).await?;
+        Ok(())
+    }
+
+    pub async fn subscribe_to_actions(&self, client: &mut Client<'_, '_>) -> anyhow::Result<()> {
+        client
+            .subscribe_to_topic(&self.reboot_button.command_topic.0)
+            .await?;
         Ok(())
     }
 }

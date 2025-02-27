@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 extern crate alloc;
 
 mod binary_sensor;
+mod button;
 mod device_tracker;
 mod sensor;
 
 pub use binary_sensor::{BinarySensor, BinarySensorDeviceClass};
+pub use button::{Button, ButtonDeviceClass};
 pub use device_tracker::{DeviceTracker, DeviceTrackerAttributes};
 pub use sensor::{Sensor, SensorDeviceClass, SensorStateClass};
 

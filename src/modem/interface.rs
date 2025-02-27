@@ -468,9 +468,9 @@ async fn enter_command_mode(
     embassy_time::Timer::after_millis(1200).await;
     pins.dtr.set_high();
 
-    let mut attemts_left = 10;
-    while attemts_left > 0 {
-        attemts_left -= 1;
+    let mut attempts_left = 10;
+    while attempts_left > 0 {
+        attempts_left -= 1;
         let len = uart
             .read(uart_buf)
             .await

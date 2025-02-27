@@ -42,9 +42,9 @@ const SYSTEM_EVENT_QUEUE_SIZE: usize = 5;
 const HEAP_SIZE: usize = 56 * 1024;
 
 const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
-const PSU_DATA_IDLE_INTERVAL: Duration = Duration::from_secs(120);
+const PSU_DATA_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 const GPS_DATA_INTERVAL: Duration = Duration::from_secs(5);
-const IGNITION_SENSE_DEBOUNCE: Duration = Duration::from_secs(1);
+const IGNITION_SENSE_DEBOUNCE: Duration = Duration::from_secs(2);
 const POWERSAVE_DELAY: Duration = Duration::from_secs(
     match u64::from_str_radix(env!("POWERSAVE_DELAY_SECONDS"), 10) {
         Ok(d) => d,
