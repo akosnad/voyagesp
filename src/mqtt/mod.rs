@@ -151,18 +151,18 @@ impl<'c, 'sb, 's> Client<'c, 's> {
             ref ignition_sense_sensor,
         } = &crate::config::SystemConfig::get();
 
-        if let Some(device_tracker_availability) = ignition_sense_sensor
+        if let Some(availability) = ignition_sense_sensor
             .availability
             .first()
             .or(device_tracker.availability.first())
         {
-            let online = device_tracker_availability
+            let online = availability
                 .payload_available
                 .as_deref()
                 .unwrap_or("online");
             self.inner
                 .send_message(
-                    device_tracker_availability.topic.as_str(),
+                    availability.topic.as_str(),
                     online.as_bytes(),
                     QualityOfService::QoS0,
                     true,
@@ -252,7 +252,7 @@ impl<'c, 'sb, 's> Client<'c, 's> {
                     entity.state_topic().0.as_str(),
                     state_str.as_bytes(),
                     QualityOfService::QoS0,
-                    false,
+                    entity.retain(),
                 )
                 .with_timeout(OPERATION_TIMEOUT)
                 .await

@@ -24,6 +24,11 @@ pub trait Discoverable {
 
 pub trait Publishable {
     fn state_topic(&self) -> Topic;
+
+    /// Whether to retain state messages on the MQTT broker
+    fn retain(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
