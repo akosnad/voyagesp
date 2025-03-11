@@ -24,6 +24,10 @@ impl Publishable for DeviceTracker {
     fn state_topic(&self) -> Topic {
         self.json_attributes_topic.clone()
     }
+
+    fn retain(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
