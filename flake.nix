@@ -18,6 +18,10 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    qemu-espressif = {
+      url = "github:SFrijters/nix-qemu-espressif";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -28,6 +32,7 @@
       fenix,
       esp-dev,
       crane,
+      qemu-espressif,
       ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -50,6 +55,7 @@
           overlays = [
             fenix.overlays.default
             esp-dev.overlays.default
+            qemu-espressif.overlays.default
             self.overlays.default
           ];
 
@@ -130,6 +136,8 @@
                 cargo-espflash
 
                 mosquitto
+
+                qemu-esp32
               ];
             };
 

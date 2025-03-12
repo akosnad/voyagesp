@@ -106,8 +106,10 @@ async fn main_task(spawner: Spawner) {
 
     //TODO: actually check if OTA is valid, instead of blindly accepting
     let mut flash = esp_storage::FlashStorage::new();
-    esp_ota_nostd::ota_accept(&mut flash).expect("failed to mark OTA valid");
-    log::info!("[OTA] marked current boot as valid");
+    match esp_ota_nostd::ota_accept(&mut flash) {
+        Ok(_) => log::info!("[OTA] marked current boot as valid"),
+        Err(e) => log::error!("[OTA] failed to mark current boot as valid: {e:?}"),
+    }
 
     // Ignition sense
     let ignition_sense = Input::new(peripherals.GPIO14, esp_hal::gpio::Pull::Down);

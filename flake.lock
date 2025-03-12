@@ -112,6 +112,26 @@
         "type": "github"
       }
     },
+    "qemu-espressif": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1741733608,
+        "narHash": "sha256-W81VxwZ9D/hwieMYnbnfduKtLBnAP1i4eus/fAskzQU=",
+        "owner": "SFrijters",
+        "repo": "nix-qemu-espressif",
+        "rev": "fe20c60899cf434c986130ee0db1bd2f38c0d9fc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "SFrijters",
+        "repo": "nix-qemu-espressif",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "crane": "crane",
@@ -119,6 +139,7 @@
         "fenix": "fenix",
         "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs",
+        "qemu-espressif": "qemu-espressif",
         "treefmt-nix": "treefmt-nix"
       }
     },

@@ -3,7 +3,7 @@
 target/
 
 /config.yml
-/ota.bin
+/*.bin
 
 debug/
 
