@@ -3,7 +3,7 @@ use atat::{
     nom::FindSubstring, AtatIngress as _, DefaultDigester, Ingress, ResponseSlot, UrcChannel,
 };
 use embassy_sync::signal::Signal;
-use static_cell::make_static;
+use static_cell::StaticCell;
 
 use super::*;
 
@@ -17,7 +17,7 @@ const UART_DATA_BUF_SIZE: usize = DATA_PIPE_SIZE;
 
 pub static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
 
-pub type ModemUart = Uart<'static, UART2, Async>;
+pub type ModemUart = Uart<'static, Async>;
 type CommandPipe = embassy_sync::pipe::Pipe<CriticalSectionRawMutex, COMMAND_PIPE_SIZE>;
 type CommandRx = embassy_sync::pipe::Reader<'static, CriticalSectionRawMutex, COMMAND_PIPE_SIZE>;
 type CommandTx = embassy_sync::pipe::Writer<'static, CriticalSectionRawMutex, COMMAND_PIPE_SIZE>;
@@ -40,9 +40,9 @@ enum Mode {
 }
 
 struct Pins {
-    pub dtr: Output<'static, AnyPin>,
-    pub pwrkey: Output<'static, AnyPin>,
-    pub power_on: Output<'static, AnyPin>,
+    pub dtr: Output<'static>,
+    pub pwrkey: Output<'static>,
+    pub power_on: Output<'static>,
 }
 
 pub struct ModemInterface {
@@ -55,27 +55,39 @@ pub struct ModemInterface {
 impl ModemInterface {
     pub async fn new(
         spawner: &embassy_executor::Spawner,
-        dtr: Output<'static, AnyPin>,
-        ri: Input<'static, AnyPin>,
-        pwrkey: Output<'static, AnyPin>,
-        power_on: Output<'static, AnyPin>,
+        dtr: Output<'static>,
+        ri: Input<'static>,
+        pwrkey: Output<'static>,
+        power_on: Output<'static>,
         uart: ModemUart,
     ) -> anyhow::Result<(Self, DataTx, DataRx)> {
         let (cmd_tx_reader, cmd_tx_writer) = {
-            let cmd_tx = make_static!(CommandPipe::new());
+            let cmd_tx = {
+                static CELL: StaticCell<CommandPipe> = StaticCell::new();
+                CELL.init(CommandPipe::new())
+            };
             cmd_tx.split()
         };
         let (cmd_rx_reader, cmd_rx_writer) = {
-            let cmd_rx = make_static!(CommandPipe::new());
+            let cmd_rx = {
+                static CELL: StaticCell<CommandPipe> = StaticCell::new();
+                CELL.init(CommandPipe::new())
+            };
             cmd_rx.split()
         };
 
         let (data_tx_reader, data_tx_writer) = {
-            let data_tx = make_static!(DataPipe::new());
+            let data_tx = {
+                static CELL: StaticCell<DataPipe> = StaticCell::new();
+                CELL.init(DataPipe::new())
+            };
             data_tx.split()
         };
         let (data_rx_reader, data_rx_writer) = {
-            let data_rx = make_static!(DataPipe::new());
+            let data_rx = {
+                static CELL: StaticCell<DataPipe> = StaticCell::new();
+                CELL.init(DataPipe::new())
+            };
             data_rx.split()
         };
 
@@ -244,7 +256,7 @@ async fn io_task(
     mut data_tx_reader: DataRx,
     mut data_rx_writer: DataTx,
     pins: Arc<Mutex<CriticalSectionRawMutex, Pins>>,
-    mut ri: Input<'static, AnyPin>,
+    mut ri: Input<'static>,
 ) -> ! {
     use embassy_futures::select::{Either3, Either4};
     use embedded_io_async::{Read, Write};

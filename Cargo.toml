@@ -17,37 +17,39 @@ esp-backtrace = { version = "0.14.0", features = [
     "println",
     "custom-halt",
 ] }
-esp-hal = { version = "0.21.0", features = ["esp32"] }
+esp-hal = { version = "0.23", features = ["esp32"] }
 esp-println = { version = "0.11.0", features = ["esp32", "log"] }
 log = { version = "0.4.21" }
-esp-alloc = { version = "0.5.0" }
+esp-alloc = { version = "0.6" }
 embedded-io = "0.6.1"
-esp-wifi = { version = "0.10.1", features = ["esp32", "embassy-net", "wifi", "tcp", "udp", "esp-alloc", "ipv4", "icmp", "phy-enable-usb"] }
+esp-wifi = { version = "0.12", features = ["esp32", "wifi", "esp-alloc"] }
 heapless = { version = "0.8.0", default-features = false }
-smoltcp = { version = "0.11.0", default-features = false, features = ["dns-max-server-count-2", "medium-ethernet", "proto-dhcpv4", "proto-dns", "proto-igmp", "proto-ipv4", "socket-dhcpv4", "socket-icmp", "socket-raw", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.12", default-features = false, features = ["dns-max-server-count-2", "medium-ethernet", "proto-dhcpv4", "proto-dns", "proto-ipv4", "socket-dhcpv4", "socket-icmp", "socket-raw", "socket-tcp", "socket-udp"] }
 axp192 = "0.2.0"
 ublox = { version = "0.4.5", default-features = false, features = ["alloc", "serde"] }
 serde = { version = "1.0.210", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
 anyhow = { version = "1.0.89", default-features = false }
-embassy-executor = { version = "0.6.0", features = ["executor-thread", "integrated-timers", "nightly"] }
-embassy-time = { version = "0.3.2" }
-esp-hal-embassy = { version = "0.4.0", features = ["esp32", "log"] }
-embassy-net = { version = "0.4.0", features = ["dhcpv4", "dhcpv4-hostname", "dns", "log", "medium-ip", "proto-ipv4", "tcp", "udp"] }
-static_cell = { version = "2.1.0", features = ["nightly"] }
+embassy-executor = { version = "0.7", features = ["executor-thread", "nightly"] }
+embassy-time = { version = "0.4" }
+esp-hal-embassy = { version = "0.6", features = ["esp32", "log"] }
+embassy-net = { version = "0.6", features = ["dhcpv4", "dhcpv4-hostname", "dns", "log", "medium-ip", "proto-ipv4", "tcp", "udp"] }
+static_cell = { version = "2.1.0" }
 embedded-io-async = { version = "0.6.1", features = ["alloc"] }
 embassy-sync = "0.6.0"
 embassy-futures = "0.1.1"
-atat = { version = "0.23.0", default-features = false, features = ["atat_derive", "derive", "log", "serde_at"] }
+atat = { version = "0.24", default-features = false, features = ["atat_derive", "derive", "log", "serde_at"] }
 serde_at = { version = "0.23.0", features = ["alloc"] }
 embassy-net-ppp = { version = "0.1.0", features = ["log"] }
 rust-mqtt = { git = "https://github.com/akosnad/rust-mqtt.git", default-features = false, features = ["no_std"] }
 hass-types = { path = "hass-types" }
+esp-ota-nostd = "0.1.0"
+esp-storage = { version = "0.4.0", features = ["esp32", "nor-flash"] }
 
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization
-opt-level = "s"
+opt-level = 3 # needed for esp-storage
 
 [profile.release]
 codegen-units = 1 # LLVM can perform better optimizations using a single thread
@@ -55,7 +57,7 @@ debug = 2
 debug-assertions = false
 incremental = false
 lto = 'fat'
-opt-level = 's'
+opt-level = 3 # needed for esp-storage
 overflow-checks = false
 
 [build-dependencies]

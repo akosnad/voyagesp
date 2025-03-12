@@ -15,6 +15,7 @@ struct Config {
     diagnostic_entities_topic_prefix: String,
     device_tracker_config: DeviceTracker,
     ignition_sense_sensor_config: BinarySensor,
+    ota_topic: String,
 }
 
 impl Config {
@@ -33,6 +34,7 @@ impl Config {
             !self.ignition_sense_sensor_config.availability.is_empty(),
             "ignition_sense_sensor_config.availability should contain at least one element"
         );
+        assert!(!self.ota_topic.is_empty(), "ota topic is empty");
     }
 
     fn export_vars(&self) {
@@ -52,12 +54,12 @@ impl Config {
             "cargo:rustc-env=DIAGNOSTIC_ENTITIES_TOPIC_PREFIX={}",
             self.diagnostic_entities_topic_prefix
         );
+        println!("cargo:rustc-env=OTA_TOPIC={}", self.ota_topic);
     }
 }
 
 fn main() {
     println!("cargo:rustc-link-arg-bins=-Tlinkall.x");
-    println!("cargo:rustc-link-arg-bins=-Trom_functions.x");
 
     println!("cargo:rerun-if-changed=config.yml");
     let config = {

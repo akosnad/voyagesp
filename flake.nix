@@ -128,6 +128,8 @@
 
                 cargo-generate
                 cargo-espflash
+
+                mosquitto
               ];
             };
 

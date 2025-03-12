@@ -3,7 +3,7 @@ use alloc::format;
 use anyhow::anyhow;
 use core::str::FromStr;
 use embassy_futures::select::{select, select3, Either, Either3};
-use embassy_net::{driver::Driver, tcp::TcpSocket, Ipv4Address, Stack};
+use embassy_net::{tcp::TcpSocket, Ipv4Address, Stack};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, TimeoutError, Timer, WithTimeout};
 use esp_hal::rng::Rng;
@@ -26,9 +26,6 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(35);
 const MQTT_KEEPALIVE_INTERVAL: usize = 30;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-type WifiStack =
-    &'static embassy_net::Stack<esp_wifi::wifi::WifiDevice<'static, esp_wifi::wifi::WifiStaDevice>>;
-type ModemStack = &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>;
 type ClientInner<'c, 's> = MqttClient<'c, TcpSocket<'s>, MAX_PROPERTIES, Rng>;
 
 #[derive(Debug)]
@@ -77,13 +74,19 @@ impl PublishEvent {
 }
 
 #[derive(Debug)]
-enum RemoteAction {
+enum RemoteAction<'a> {
     Reboot,
+    Ota(&'a [u8]),
 }
 
-impl TryFrom<(&str, &[u8])> for RemoteAction {
+impl<'a> TryFrom<(&str, &'a [u8])> for RemoteAction<'a> {
     type Error = ();
-    fn try_from((topic, _payload): (&str, &[u8])) -> Result<Self, ()> {
+    fn try_from((topic, payload): (&str, &'a [u8])) -> Result<Self, ()> {
+        let ota_topic = crate::config::SystemConfig::get().ota_topic;
+        if topic == ota_topic {
+            return Ok(RemoteAction::Ota(payload));
+        }
+
         const TOPIC_PREFIX: &str = env!("DIAGNOSTIC_ENTITIES_TOPIC_PREFIX");
         let inner_topic = topic
             .strip_prefix(format!("{TOPIC_PREFIX}/").as_str())
@@ -96,14 +99,14 @@ impl TryFrom<(&str, &[u8])> for RemoteAction {
     }
 }
 
-impl RemoteAction {
+impl RemoteAction<'_> {
     async fn handle(self) -> anyhow::Result<()> {
-        log::debug!("Handling remote action: {:?}", self);
         match self {
             RemoteAction::Reboot => {
                 esp_hal::reset::software_reset();
                 unreachable!();
             }
+            RemoteAction::Ota(ota_data) => crate::ota::start(ota_data).await,
         }
     }
 }
@@ -132,6 +135,7 @@ impl<'c, 'sb, 's> Client<'c, 's> {
         let crate::config::SystemConfig {
             ref device_tracker,
             ref ignition_sense_sensor,
+            ota_topic,
         } = &crate::config::SystemConfig::get();
 
         self.send_discovery_config(device_tracker).await?;
@@ -141,6 +145,7 @@ impl<'c, 'sb, 's> Client<'c, 's> {
         diagnostic_entities.send_discovery_configs(self).await?;
         if allow_actions {
             diagnostic_entities.subscribe_to_actions(self).await?;
+            self.subscribe_to_topic(ota_topic).await?;
         }
         Ok(())
     }
@@ -149,6 +154,7 @@ impl<'c, 'sb, 's> Client<'c, 's> {
         let crate::config::SystemConfig {
             ref device_tracker,
             ref ignition_sense_sensor,
+            ota_topic: _,
         } = &crate::config::SystemConfig::get();
 
         if let Some(availability) = ignition_sense_sensor
@@ -278,14 +284,18 @@ struct Connection<'s> {
 }
 
 pub struct Mqtt {
-    wifi_stack: WifiStack,
-    modem_stack: ModemStack,
+    wifi_stack: Stack<'static>,
+    modem_stack: Stack<'static>,
     config: ClientConfig<'static, MAX_PROPERTIES, esp_hal::rng::Rng>,
     pub_queue: Channel<CriticalSectionRawMutex, PublishEvent, EVENT_QUEUE_SIZE>,
 }
 
 impl Mqtt {
-    pub fn new(wifi_stack: WifiStack, modem_stack: ModemStack, rng: esp_hal::rng::Rng) -> Self {
+    pub fn new(
+        wifi_stack: Stack<'static>,
+        modem_stack: Stack<'static>,
+        rng: esp_hal::rng::Rng,
+    ) -> Self {
         let system_config = crate::config::SystemConfig::get();
 
         let mut config =
@@ -344,7 +354,7 @@ impl Mqtt {
             }
             // Modem
             Either::Second(_) => {
-                let ip = match get_host_ip(env!("MQTT_MODEM_HOST"), self.modem_stack).await {
+                let ip = match get_host_ip(env!("MQTT_MODEM_HOST"), &self.modem_stack).await {
                     Ok(ip) => ip,
                     Err(e) => {
                         anyhow::bail!("Failed to get IP address for MQTT modem endpoint: {e:?}")
@@ -514,14 +524,16 @@ impl Mqtt {
     }
 }
 
-async fn get_host_ip<D: Driver>(host: &str, stack: &Stack<D>) -> anyhow::Result<Ipv4Address> {
+async fn get_host_ip(host: &str, stack: &Stack<'static>) -> anyhow::Result<Ipv4Address> {
     stack
         .dns_query(host, smoltcp::wire::DnsQueryType::A)
         .await
         .map_err(|e| anyhow!("Failed to query DNS for {}: {:?}", host, e))
         .and_then(|res| {
             res.first()
-                .map(|ip| Ok(Ipv4Address::from_bytes(ip.as_bytes())))
+                .map(|ip| match ip {
+                    embassy_net::IpAddress::Ipv4(addr) => Ok(addr.clone()),
+                })
                 .unwrap_or_else(|| Err(anyhow!("No IP address found for {}", host)))
         })
 }

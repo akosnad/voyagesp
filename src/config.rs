@@ -8,6 +8,7 @@ static CONFIG: OnceLock<SystemConfig> = OnceLock::new();
 pub struct SystemConfig {
     pub device_tracker: DeviceTracker,
     pub ignition_sense_sensor: BinarySensor,
+    pub ota_topic: &'static str,
 }
 impl SystemConfig {
     pub fn get() -> &'static Self {
@@ -17,6 +18,7 @@ impl SystemConfig {
                 env!("OUT_DIR"),
                 "/ignition_sense_sensor_config.rs"
             )),
+            ota_topic: env!("OTA_TOPIC"),
         })
     }
 }

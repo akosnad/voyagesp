@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{Read as _, ReadReady as _, Write as _};
-use esp_hal::{peripherals::UART1, uart::Uart, Async};
+use esp_hal::{uart::Uart, Async};
 use hass_types::DeviceTrackerAttributes;
 use log::{info, trace};
 use ublox::{GpsFix, PacketRef};
@@ -50,7 +50,7 @@ enum GpsState {
     Ready,
 }
 
-type GpsUart = Uart<'static, UART1, Async>;
+type GpsUart = Uart<'static, Async>;
 
 pub struct Gps<const BAUD: u32> {
     state: Arc<Mutex<CriticalSectionRawMutex, GpsState>>,
@@ -86,7 +86,7 @@ impl<const BAUD: u32> Gps<BAUD> {
                 GpsState::Uninitialized => {
                     let mut uart = self.uart.lock().await;
                     *state = GpsState::Initializing;
-                    while let Err(e) = uart_init::<_, BAUD>(&mut uart).await {
+                    while let Err(e) = uart_init::<BAUD>(&mut uart).await {
                         log::error!("GPS initialization failed: {:?}", e);
                     }
                     *state = GpsState::Ready;
@@ -140,12 +140,9 @@ impl<const BAUD: u32> Gps<BAUD> {
 /// Initialize GPS hardware
 ///  
 /// [reference](https://content.u-blox.com/sites/default/files/products/documents/u-blox8-M8_ReceiverDescrProtSpec_UBX-13003221.pdf)
-async fn uart_init<T, const BAUD: u32>(
-    uart: &mut esp_hal::uart::Uart<'_, T, Async>,
-) -> anyhow::Result<()>
-where
-    T: esp_hal::uart::Instance,
-{
+async fn uart_init<const BAUD: u32>(
+    uart: &mut esp_hal::uart::Uart<'_, Async>,
+) -> anyhow::Result<()> {
     let gps_reset_packet = ublox::CfgRstBuilder {
         nav_bbr_mask: ublox::NavBbrMask::empty(), // don't clear Battery Backed RAM
         reset_mode: ublox::ResetMode::ControlledSoftwareReset,
@@ -207,21 +204,18 @@ where
     Ok(())
 }
 
-async fn uart_command<T>(
-    uart: &mut esp_hal::uart::Uart<'_, T, Async>,
+async fn uart_command(
+    uart: &mut esp_hal::uart::Uart<'_, Async>,
     cmd: &[u8],
     flush: bool,
     expect_ack: bool,
-) -> anyhow::Result<()>
-where
-    T: esp_hal::uart::Instance,
-{
+) -> anyhow::Result<()> {
     uart.write_all(cmd)
         .await
         .map_err(|e| anyhow!("Failed to write GPS command: {:?}", e))?;
 
     if flush {
-        uart.flush()
+        uart.flush_async()
             .await
             .map_err(|e| anyhow!("Failed to flush GPS UART: {:?}", e))?;
     }
@@ -235,10 +229,7 @@ where
     Ok(())
 }
 
-async fn uart_expect_ack<T>(uart: &mut esp_hal::uart::Uart<'_, T, Async>) -> anyhow::Result<()>
-where
-    T: esp_hal::uart::Instance,
-{
+async fn uart_expect_ack(uart: &mut esp_hal::uart::Uart<'_, Async>) -> anyhow::Result<()> {
     const BUF_SIZE: usize = 128;
     const MAX_ITERATIONS: usize = 500;
     let mut parser = ublox::Parser::new(Vec::new());

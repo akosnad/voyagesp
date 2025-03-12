@@ -11,13 +11,12 @@ use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 use embassy_time::{TimeoutError, WithTimeout as _};
 use esp_hal::{
-    gpio::{AnyPin, Input, Output},
-    peripherals::UART2,
+    gpio::{Input, Output},
     uart::Uart,
     Async,
 };
 use log::info;
-use static_cell::{make_static, StaticCell};
+use static_cell::StaticCell;
 
 use lib::at::{general::urc::PinStatus, Urc};
 
@@ -49,10 +48,10 @@ impl Modem {
     pub async fn new(
         spawner: &embassy_executor::Spawner,
         uart: interface::ModemUart,
-        dtr: Output<'static, AnyPin>,
-        ri: Input<'static, AnyPin>,
-        pwrkey: Output<'static, AnyPin>,
-        power_on: Output<'static, AnyPin>,
+        dtr: Output<'static>,
+        ri: Input<'static>,
+        pwrkey: Output<'static>,
+        power_on: Output<'static>,
         config_sender: embassy_sync::channel::Sender<
             'static,
             CriticalSectionRawMutex,
@@ -64,8 +63,11 @@ impl Modem {
             ModemInterface::new(spawner, dtr, ri, pwrkey, power_on, uart).await?;
         let state: Arc<Mutex<CriticalSectionRawMutex, ModemState>> = Default::default();
 
-        let ppp_state = make_static!(embassy_net_ppp::State::new());
-        let (ppp_device, ppp_runner) = embassy_net_ppp::new::<16, 16>(ppp_state);
+        let ppp_state = {
+            static CELL: StaticCell<embassy_net_ppp::State<2, 2>> = StaticCell::new();
+            CELL.init(embassy_net_ppp::State::new())
+        };
+        let (ppp_device, ppp_runner) = embassy_net_ppp::new::<2, 2>(ppp_state);
         let ppp_drop_signal = Arc::new(Signal::new());
 
         spawner
@@ -332,16 +334,21 @@ async fn ppp_task(
                 .dns_servers
                 .iter()
                 .flatten()
-                .map(|addr| Ipv4Address::from_bytes(&addr.0))
+                .map(|addr| Ipv4Address::new(addr.0[0], addr.0[1], addr.0[2], addr.0[3]))
                 .collect()
         };
 
         let config = StaticConfigV4 {
             address: embassy_net::Ipv4Cidr::new(
-                Ipv4Address::from_bytes(&address.0),
+                Ipv4Address::new(address.0[0], address.0[1], address.0[2], address.0[3]),
                 0, // no network, since we are point-to-point
             ),
-            gateway: Some(Ipv4Address::from_bytes(&gateway.0)),
+            gateway: Some(Ipv4Address::new(
+                gateway.0[0],
+                gateway.0[1],
+                gateway.0[2],
+                gateway.0[3],
+            )),
             dns_servers,
         };
 

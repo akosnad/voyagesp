@@ -3,29 +3,30 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_closure)]
 #![feature(impl_trait_in_assoc_type)]
-#![feature(const_int_from_str)]
 
 use alloc::sync::Arc;
 use core::{str::FromStr, sync::atomic::AtomicBool};
 use embassy_executor::{task, Spawner};
 use embassy_futures::yield_now;
-use embassy_net::{ConfigV4, Ipv4Address, StackResources, StaticConfigV4};
+use embassy_net::{ConfigV4, Ipv4Address, Runner, Stack, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::{
-    gpio::{Input, Io, Output},
-    prelude::*,
+    gpio::{Input, Output},
     rng::Rng,
     uart, Blocking,
 };
 use esp_hal_embassy::main;
-use esp_wifi::wifi::{
-    utils::create_network_interface, ClientConfiguration, Configuration, WifiController,
-    WifiDevice, WifiEvent, WifiStaDevice, WifiState,
+use esp_wifi::{
+    wifi::{
+        ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice,
+        WifiState,
+    },
+    EspWifiController,
 };
 use mqtt::PublishEvent;
-use static_cell::make_static;
+use static_cell::StaticCell;
 pub use voyagesp as lib;
 
 extern crate alloc;
@@ -34,12 +35,13 @@ mod config;
 mod gps;
 mod modem;
 mod mqtt;
+mod ota;
 
 const GPS_BAUD: u32 = 9600;
 const MODEM_BAUD: u32 = 115_200;
 
 const SYSTEM_EVENT_QUEUE_SIZE: usize = 5;
-const HEAP_SIZE: usize = 56 * 1024;
+const HEAP_SIZE: usize = 68 * 1024;
 
 const PSU_DATA_INTERVAL: Duration = Duration::from_secs(15);
 const PSU_DATA_IDLE_INTERVAL: Duration = Duration::from_secs(60);
@@ -65,7 +67,7 @@ type SystemEventReceiver = embassy_sync::channel::Receiver<
     SYSTEM_EVENT_QUEUE_SIZE,
 >;
 
-type Psu = axp192::Axp192<esp_hal::i2c::I2c<'static, esp_hal::peripherals::I2C0, Blocking>>;
+type Psu = axp192::Axp192<esp_hal::i2c::master::I2c<'static, Blocking>>;
 type Gps = gps::Gps<GPS_BAUD>;
 
 #[derive(Debug)]
@@ -102,17 +104,22 @@ async fn main_task(spawner: Spawner) {
 
     esp_println::logger::init_logger(log::LevelFilter::Debug);
 
-    let io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
+    //TODO: actually check if OTA is valid, instead of blindly accepting
+    let mut flash = esp_storage::FlashStorage::new();
+    esp_ota_nostd::ota_accept(&mut flash).expect("failed to mark OTA valid");
+    log::info!("[OTA] marked current boot as valid");
 
     // Ignition sense
-    let ignition_sense = Input::new(io.pins.gpio14, esp_hal::gpio::Pull::Down);
+    let ignition_sense = Input::new(peripherals.GPIO14, esp_hal::gpio::Pull::Down);
     let event_channel = {
-        let chan: embassy_sync::channel::Channel<
-            CriticalSectionRawMutex,
-            SystemEvent,
-            SYSTEM_EVENT_QUEUE_SIZE,
-        > = embassy_sync::channel::Channel::new();
-        make_static!(chan)
+        static CELL: StaticCell<
+            embassy_sync::channel::Channel<
+                CriticalSectionRawMutex,
+                SystemEvent,
+                SYSTEM_EVENT_QUEUE_SIZE,
+            >,
+        > = StaticCell::new();
+        CELL.init(embassy_sync::channel::Channel::new())
     };
 
     let ignition_state = Arc::new(AtomicBool::new(false));
@@ -126,8 +133,14 @@ async fn main_task(spawner: Spawner) {
 
     // PSU
     let psu_i2c =
-        esp_hal::i2c::I2c::new(peripherals.I2C0, io.pins.gpio21, io.pins.gpio22, 100.kHz());
-    let psu: &mut Psu = make_static!(axp192::Axp192::new(psu_i2c));
+        esp_hal::i2c::master::I2c::new(peripherals.I2C0, esp_hal::i2c::master::Config::default())
+            .expect("failed to init i2c")
+            .with_sda(peripherals.GPIO21)
+            .with_scl(peripherals.GPIO22);
+    let psu = {
+        static CELL: StaticCell<Psu> = StaticCell::new();
+        CELL.init(axp192::Axp192::new(psu_i2c))
+    };
 
     psu.set_dcdc1_on(false).unwrap();
     psu.set_ldo2_on(false).unwrap();
@@ -141,111 +154,126 @@ async fn main_task(spawner: Spawner) {
 
     // WIFI
     let mut rng = Rng::new(peripherals.RNG);
-    let wifi_init = esp_wifi::init(
-        esp_wifi::EspWifiInitFor::Wifi,
-        timg0.timer1,
-        rng,
-        peripherals.RADIO_CLK,
-    )
-    .expect("Failed to initialize WiFi clocks");
-    let mut socket_storage: [smoltcp::iface::SocketStorage; 3] = Default::default();
-    let (_wifi_interface, wifi_device, wifi_controller, _wifi_sockets) = create_network_interface(
-        &wifi_init,
+    let wifi_init = {
+        static CELL: StaticCell<EspWifiController<'static>> = StaticCell::new();
+        CELL.init(
+            esp_wifi::init(timg0.timer1, rng, peripherals.RADIO_CLK)
+                .expect("Failed to initialize WiFi clocks"),
+        )
+    };
+    let (wifi_device, wifi_controller) = esp_wifi::wifi::new_with_config::<WifiStaDevice>(
+        wifi_init,
         peripherals.WIFI,
-        WifiStaDevice,
-        &mut socket_storage,
+        esp_wifi::wifi::ClientConfiguration {
+            ssid: heapless::String::from_str(env!("WIFI_SSID"))
+                .expect("Failed to create SSID string"),
+            password: heapless::String::from_str(env!("WIFI_PASSWORD"))
+                .expect("Failed to create password string"),
+            ..Default::default()
+        },
     )
     .expect("Failed to create WiFi network interface");
 
-    let stack_resources: &'static mut StackResources<3> = make_static!(StackResources::new());
-    let wifi_stack = make_static!(embassy_net::Stack::new(
-        wifi_device,
-        embassy_net::Config::dhcpv4(Default::default()),
-        stack_resources,
-        1234u64,
-    ));
+    let stack_resources = {
+        static CELL: StaticCell<StackResources<3>> = StaticCell::new();
+        CELL.init(StackResources::new())
+    };
+    let (wifi_stack, wifi_runner) = {
+        static CELL: StaticCell<(Stack, Runner<WifiDevice<'static, WifiStaDevice>>)> =
+            StaticCell::new();
+        CELL.init(embassy_net::new(
+            wifi_device,
+            embassy_net::Config::dhcpv4(Default::default()),
+            stack_resources,
+            1234u64,
+        ))
+    };
 
     spawner
         .spawn(wifi_connection(wifi_controller))
         .expect("Failed to spawn WiFi connection task");
     spawner
-        .spawn(wifi_net_task(wifi_stack))
+        .spawn(wifi_net_task(wifi_runner))
         .expect("Failed to spawn WiFi task");
 
     // GPS
-    let gps_uart = esp_hal::uart::Uart::new_async_with_config(
+    let gps_uart = esp_hal::uart::Uart::new(
         peripherals.UART1,
-        uart::config::Config {
-            baudrate: GPS_BAUD,
-            data_bits: uart::config::DataBits::DataBits8,
-            parity: uart::config::Parity::ParityNone,
-            stop_bits: uart::config::StopBits::STOP1,
-            rx_timeout: Some(50),
-            ..Default::default()
-        },
-        io.pins.gpio13,
-        io.pins.gpio15,
+        uart::Config::default()
+            .with_baudrate(GPS_BAUD)
+            .with_data_bits(uart::DataBits::_8)
+            .with_parity(uart::Parity::None)
+            .with_stop_bits(uart::StopBits::_1)
+            .with_rx_timeout(50),
     )
-    .expect("Failed to initialize GPS UART");
+    .expect("Failed to initialize GPS UART")
+    .with_rx(peripherals.GPIO13)
+    .with_tx(peripherals.GPIO15)
+    .into_async();
 
-    let gps: &mut Gps = {
-        let gps = gps::Gps::new(gps_uart)
-            .await
-            .expect("Failed to initialize GPS");
-        make_static!(gps)
+    let gps = {
+        static CELL: StaticCell<Gps> = StaticCell::new();
+        CELL.init(
+            gps::Gps::new(gps_uart)
+                .await
+                .expect("Failed to initialize GPS"),
+        )
     };
     spawner
         .spawn(gps_task(gps))
         .expect("Failed to spawn GPS task");
 
     // MODEM
-    let modem_dtr = Output::new(io.pins.gpio32, esp_hal::gpio::Level::Low);
-    let modem_ri = Input::new(io.pins.gpio33, esp_hal::gpio::Pull::None);
+    let modem_dtr = Output::new(peripherals.GPIO32, esp_hal::gpio::Level::Low);
+    let modem_ri = Input::new(peripherals.GPIO33, esp_hal::gpio::Pull::None);
 
-    let modem_pwrkey = Output::new(io.pins.gpio4, esp_hal::gpio::Level::Low);
-    let modem_power_on = Output::new(io.pins.gpio25, esp_hal::gpio::Level::Low);
+    let modem_pwrkey = Output::new(peripherals.GPIO4, esp_hal::gpio::Level::Low);
+    let modem_power_on = Output::new(peripherals.GPIO25, esp_hal::gpio::Level::Low);
 
-    let modem_uart = esp_hal::uart::Uart::new_async_with_config(
+    let modem_uart = esp_hal::uart::Uart::new(
         peripherals.UART2,
-        uart::config::Config {
-            baudrate: MODEM_BAUD,
-            data_bits: uart::config::DataBits::DataBits8,
-            parity: uart::config::Parity::ParityNone,
-            stop_bits: uart::config::StopBits::STOP1,
-            rx_timeout: Some(50),
-            ..Default::default()
-        },
-        io.pins.gpio26,
-        io.pins.gpio27,
+        uart::Config::default()
+            .with_baudrate(MODEM_BAUD)
+            .with_data_bits(uart::DataBits::_8)
+            .with_parity(uart::Parity::None)
+            .with_stop_bits(uart::StopBits::_1)
+            .with_rx_timeout(50),
     )
-    .expect("Failed to initialize modem UART");
+    .expect("Failed to initialize modem UART")
+    .with_rx(peripherals.GPIO26)
+    .with_tx(peripherals.GPIO27)
+    .into_async();
 
     let config_chan = {
-        let chan: embassy_sync::channel::Channel<CriticalSectionRawMutex, StaticConfigV4, 1> =
-            embassy_sync::channel::Channel::new();
-        make_static!(chan)
+        static CELL: StaticCell<
+            embassy_sync::channel::Channel<CriticalSectionRawMutex, StaticConfigV4, 1>,
+        > = StaticCell::new();
+        CELL.init(embassy_sync::channel::Channel::new())
     };
     let (modem, modem_ppp) = {
-        let modem = modem::Modem::new(
-            &spawner,
-            modem_uart,
-            modem_dtr,
-            modem_ri,
-            modem_pwrkey,
-            modem_power_on,
-            config_chan.sender(),
+        static CELL: StaticCell<(modem::Modem, embassy_net_ppp::Device<'static>)> =
+            StaticCell::new();
+        CELL.init(
+            modem::Modem::new(
+                &spawner,
+                modem_uart,
+                modem_dtr,
+                modem_ri,
+                modem_pwrkey,
+                modem_power_on,
+                config_chan.sender(),
+            )
+            .await
+            .expect("Failed to initialize modem"),
         )
-        .await
-        .expect("Failed to initialize modem");
-        make_static!(modem)
     };
     spawner
         .spawn(modem_task(modem))
         .expect("Failed to spawn modem task");
 
     let stack_resources = {
-        let resources: StackResources<3> = StackResources::new();
-        make_static!(resources)
+        static CELL: StaticCell<StackResources<3>> = StaticCell::new();
+        CELL.init(StackResources::new())
     };
     let seed = {
         let mut buf = [0u8; 8];
@@ -253,23 +281,27 @@ async fn main_task(spawner: Spawner) {
         u64::from_le_bytes(buf)
     };
 
-    let modem_stack = {
+    let (modem_stack, modem_runner) = {
         // this is a hack around the non-exhaustive struct `embassy_net::Config`
         let dummy_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
             address: embassy_net::Ipv4Cidr::new(Ipv4Address::new(0, 0, 0, 0), 0),
             gateway: Some(Ipv4Address::new(0, 0, 0, 0)),
             dns_servers: heapless::Vec::new(),
         });
-        let stack = embassy_net::Stack::new(modem_ppp, dummy_config, stack_resources, seed);
+        let (stack, runner) = embassy_net::new(modem_ppp, dummy_config, stack_resources, seed);
         // here we set the actual config; this is the only way without violating the non-exhaustive
         // initialization of `embassy_net::Config`
         stack.set_config_v4(ConfigV4::None);
 
-        make_static!(stack)
+        static CELL: StaticCell<(
+            Stack,
+            Runner<'static, &mut embassy_net_ppp::Device<'static>>,
+        )> = StaticCell::new();
+        CELL.init((stack, runner))
     };
 
     spawner
-        .spawn(modem_net(modem_stack))
+        .spawn(modem_net(modem_runner))
         .expect("Failed to spawn modem network task");
     spawner
         .spawn(modem_stack_config_setter(
@@ -279,7 +311,14 @@ async fn main_task(spawner: Spawner) {
         .expect("Failed to spawn modem stack config setter");
 
     // MQTT
-    let mqtt = make_static!(mqtt::Mqtt::new(wifi_stack, modem_stack, rng));
+    let mqtt = {
+        static CELL: StaticCell<mqtt::Mqtt> = StaticCell::new();
+        CELL.init(mqtt::Mqtt::new(
+            wifi_stack.clone(),
+            modem_stack.clone(),
+            rng,
+        ))
+    };
     spawner
         .spawn(mqtt_task(mqtt))
         .expect("Failed to spawn MQTT task");
@@ -391,7 +430,7 @@ async fn ignition_sense_task(
 ) -> ! {
     let mut last_level = None;
     loop {
-        let level = sense.get_level();
+        let level = sense.level();
         if last_level
             .map(|last_level| level != last_level)
             .unwrap_or(true)
@@ -410,7 +449,7 @@ async fn ignition_sense_task(
 
 #[task]
 async fn modem_stack_config_setter(
-    stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
+    stack: &'static embassy_net::Stack<'static>,
     config_chan: embassy_sync::channel::Receiver<
         'static,
         CriticalSectionRawMutex,
@@ -427,15 +466,18 @@ async fn modem_stack_config_setter(
 
 #[task]
 async fn modem_net(
-    stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
+    runner: &'static mut embassy_net::Runner<
+        'static,
+        &'static mut embassy_net_ppp::Device<'static>,
+    >,
 ) {
-    stack.run().await;
+    runner.run().await;
 }
 
 #[task]
 async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
     loop {
-        if esp_wifi::wifi::get_wifi_state() == WifiState::StaConnected {
+        if esp_wifi::wifi::wifi_state() == WifiState::StaConnected {
             // wait until we're no longer connected
             controller.wait_for_event(WifiEvent::StaDisconnected).await;
             log::info!("WiFi disconnected");
@@ -454,14 +496,11 @@ async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
                 .set_configuration(&client_config)
                 .expect("Failed to set WiFi configuration");
             log::info!("Starting WiFi...");
-            controller
-                .start()
-                .await
-                .expect("Failed to start WiFi controller");
+            controller.start().expect("Failed to start WiFi controller");
             log::info!("Started WiFi");
         }
 
-        match controller.connect().await {
+        match controller.connect_async().await {
             Ok(_) => log::info!("Wifi connected"),
             Err(_) => Timer::after(Duration::from_millis(5000)).await,
         }
@@ -469,8 +508,10 @@ async fn wifi_connection(mut controller: WifiController<'static>) -> ! {
 }
 
 #[task]
-async fn wifi_net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>) {
-    stack.run().await;
+async fn wifi_net_task(
+    runner: &'static mut embassy_net::Runner<'static, WifiDevice<'static, WifiStaDevice>>,
+) {
+    runner.run().await;
 }
 
 #[task]
@@ -492,7 +533,7 @@ async fn mqtt_task(mqtt: &'static mqtt::Mqtt) {
 async fn modem_power_task(
     modem: &'static modem::Modem,
     ignition_state: Arc<AtomicBool>,
-    modem_stack: &'static embassy_net::Stack<&'static mut embassy_net_ppp::Device<'static>>,
+    modem_stack: &'static embassy_net::Stack<'static>,
 ) {
     let mut ignition_off_start: Option<Instant> = None;
     loop {
